@@ -248,23 +248,23 @@ class AttributionGraph:
                                     output_vector=skip.to(dtype=torch.bfloat16))
                 self.nodes[skip_node.id] = skip_node
                 self.nodes_by_layer_and_token[layer_index][token_position].append(skip_node)
-        # Create the attention nodes
-        for layer_index in range(len(self.attention_patterns)):
-            for head in range(len(self.attention_patterns[layer_index][0])):
-                for source_token_position in range(seq_len):
-                    for target_token_position in range(source_token_position+1):
+        # # Create the attention nodes
+        # for layer_index in range(len(self.attention_patterns)):
+        #     for head in range(len(self.attention_patterns[layer_index][0])):
+        #         for source_token_position in range(seq_len):
+        #             for target_token_position in range(source_token_position+1):
 
 
-                        attention_node = AttentionNode(id=f"attention_{layer_index}_{head}_{source_token_position}_{target_token_position}",
-                                                      layer_index=layer_index,
-                                                      head=head,
-                                                      token_position=target_token_position,
-                                                      source_token_position=source_token_position,
-                                                      list_contributions=[],
-                                                      input_vector=self.OVs[layer_index][head]*self.attention_patterns[layer_index][0,head,target_token_position,source_token_position],
-                                                      output_vector=self.OVs[layer_index][head])
-                        self.nodes[attention_node.id] = attention_node
-                        self.nodes_by_layer_and_token[layer_index][source_token_position].append(attention_node)
+        #                 attention_node = AttentionNode(id=f"attention_{layer_index}_{head}_{source_token_position}_{target_token_position}",
+        #                                               layer_index=layer_index,
+        #                                               head=head,
+        #                                               token_position=target_token_position,
+        #                                               source_token_position=source_token_position,
+        #                                               list_contributions=[],
+        #                                               input_vector=self.OVs[layer_index][head]*self.attention_patterns[layer_index][0,head,target_token_position,source_token_position],
+        #                                               output_vector=self.OVs[layer_index][head])
+        #                 self.nodes[attention_node.id] = attention_node
+        #                 self.nodes_by_layer_and_token[layer_index][source_token_position].append(attention_node)
                         
         # Create the output node
         # Top 10 logits
