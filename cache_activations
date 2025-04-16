@@ -1,0 +1,10 @@
+CUDA_VISIBLE_DEVICES=1 python cache.py HuggingFaceTB/SmolLM2-135M /mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/ --num_gpus 1  --dataset_repo 'EleutherAI/fineweb-edu-dedup-10b' --dataset_split 'train[:1%]' --n_tokens 10_000_000  --hookpoints layers.0.mlp layers.1.mlp layers.2.mlp layers.3.mlp layers.4.mlp layers.5.mlp layers.6.mlp --filter_bos --name transcoder_128x &
+wait
+CUDA_VISIBLE_DEVICES=2 python cache.py HuggingFaceTB/SmolLM2-135M /mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/ --num_gpus 1  --dataset_repo 'EleutherAI/fineweb-edu-dedup-10b' --dataset_split 'train[:1%]' --n_tokens 10_000_000  --hookpoints layers.7.mlp layers.8.mlp layers.9.mlp layers.10.mlp layers.11.mlp layers.12.mlp layers.13.mlp --filter_bos --name transcoder_128x &
+wait
+CUDA_VISIBLE_DEVICES=3 python cache.py HuggingFaceTB/SmolLM2-135M /mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/ --num_gpus 1  --dataset_repo 'EleutherAI/fineweb-edu-dedup-10b' --dataset_split 'train[:1%]' --n_tokens 10_000_000  --hookpoints layers.14.mlp layers.15.mlp layers.16.mlp layers.17.mlp layers.18.mlp layers.19.mlp layers.20.mlp --filter_bos --name transcoder_128x &
+wait
+CUDA_VISIBLE_DEVICES=4 python cache.py HuggingFaceTB/SmolLM2-135M /mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/ --num_gpus 1  --dataset_repo 'EleutherAI/fineweb-edu-dedup-10b' --dataset_split 'train[:1%]' --n_tokens 10_000_000  --hookpoints layers.21.mlp layers.22.mlp layers.23.mlp layers.24.mlp layers.25.mlp layers.26.mlp layers.27.mlp  --filter_bos --name transcoder_128x &
+wait
+CUDA_VISIBLE_DEVICES=5 python cache.py HuggingFaceTB/SmolLM2-135M /mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/ --num_gpus 1  --dataset_repo 'EleutherAI/fineweb-edu-dedup-10b' --dataset_split 'train[:1%]' --n_tokens 10_000_000  --hookpoints layers.28.mlp layers.29.mlp  --filter_bos --name transcoder_128x &
+
