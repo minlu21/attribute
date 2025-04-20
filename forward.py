@@ -110,8 +110,8 @@ for hookpoint in hookpoints_mlp:
                 device="cuda",
             )
     transcoders[hookpoint] = sae
-#prompt = "When John and Mary went to the store, John gave a bag to"
-prompt = "Cow Cow Fish Fish Cat"
+prompt = "When John and Mary went to the store, John gave a bag to"
+#prompt = "Cow Cow Fish Fish Cat"
 
 attn_values = {}
 first_ln = {}
