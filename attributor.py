@@ -107,7 +107,7 @@ hookpoints_mlp = [f"model.layers.{i}.mlp" for i in range(model.config.num_hidden
 for hookpoint in hookpoints_mlp:
     temp_hookpoint = hookpoint.replace("model.layers.", "layers.")
     sae = SparseCoder.load_from_disk(
-                f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x_normalized/{temp_hookpoint}",
+                f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/{temp_hookpoint}",
                 device="cuda",
             )
     transcoders[hookpoint] = sae
@@ -153,20 +153,24 @@ def get_mlp_hook(module, input, output):
     input = input.view(-1, input.shape[-1])
     # have to normalize input
     input_norm[module_name] = input.norm(dim=1, keepdim=True)
-    input = input / input_norm[module_name]
+    # input = input / input_norm[module_name]
     transcoder_acts = transcoder(input)
     # have to reshape output to get the batch dimension back
     transcoder_out = transcoder_acts.sae_out.view(output.shape)
     # have to unnormalize output
-    transcoder_out_constant =  output.norm(dim=2, keepdim=True)[0]
+    transcoder_out_constant = output.norm(dim=2, keepdim=True)[0]
     output_norm[module_name] = transcoder_out_constant
-    error = output - transcoder_out*output_norm[module_name]
+    transcoder_out_constant = torch.ones_like(transcoder_out_constant)
+    error = output - transcoder_out * output_norm[module_name]
 
-    skip = (input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT)
-    activations = transcoder_acts.latent_acts*transcoder_out_constant
-    transcoder_activations[module_name] = (activations, transcoder_acts.latent_indices)
+    skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
+    activations = transcoder_acts.latent_acts * transcoder_out_constant
+    transcoder_activations[module_name] = (
+        activations,
+        transcoder_acts.latent_indices,
+    )
 
-    skip_connections[module_name] = skip[0]*transcoder_out_constant
+    skip_connections[module_name] = skip[0] * transcoder_out_constant
     errors[module_name] = error[0]
 # last_layer_activations = []
 # def get_last_layer_hook(module, input, output):
@@ -217,5 +221,5 @@ attribution_graph = AttributionGraph(model,
                         transcoders[module].W_skip for module in hookpoints_mlp
                     ])
 attribution_graph.initialize_graph()
-attribution_graph.flow()
+attribution_graph.flow(50_000)
 #%%

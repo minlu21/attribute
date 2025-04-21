@@ -112,7 +112,7 @@ def main(
     for hookpoint in hookpoints_mlp:
         temp_hookpoint = hookpoint.replace("model.layers.", "layers.")
         sae = SparseCoder.load_from_disk(
-            f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x_normalized/{temp_hookpoint}",
+            f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/{temp_hookpoint}",
             device="cuda",
         )
         transcoders[hookpoint] = sae
@@ -162,12 +162,12 @@ def main(
         input = input.view(-1, input.shape[-1])
         # have to normalize input
         input_norm[module_name] = input.norm(dim=1, keepdim=True)
-        input = input / input_norm[module_name]
+        # input = input / input_norm[module_name]
         transcoder_acts = transcoder(input)
         # have to reshape output to get the batch dimension back
         transcoder_out = transcoder_acts.sae_out.view(output.shape)
         # have to unnormalize output
-        transcoder_out_constant = output.norm(dim=2, keepdim=True)[0]
+        transcoder_out_constant = 1  # output.norm(dim=2, keepdim=True)[0]
         output_norm[module_name] = transcoder_out_constant
         error = output - transcoder_out * output_norm[module_name]
 

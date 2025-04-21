@@ -108,7 +108,8 @@ hookpoints_mlp = [
 for hookpoint in hookpoints_mlp:
     temp_hookpoint = hookpoint.replace("model.layers.", "layers.")
     sae = SparseCoder.load_from_disk(
-        f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x_normalized/{temp_hookpoint}",
+        # f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x_normalized/{temp_hookpoint}",
+        f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/{temp_hookpoint}",
         device="cuda",
     )
     transcoders[hookpoint] = sae
@@ -150,8 +151,6 @@ errors = {}
 skip_connections = {}
 input_norm = {}
 output_norm = {}
-
-
 def get_mlp_hook(module, input, output):
 
     if isinstance(input, tuple):
@@ -163,21 +162,51 @@ def get_mlp_hook(module, input, output):
     input = input.view(-1, input.shape[-1])
     # have to normalize input
     input_norm[module_name] = input.norm(dim=1, keepdim=True)
-    input = input / input_norm[module_name]
+    # input = input / input_norm[module_name]
     transcoder_acts = transcoder(input)
     # have to reshape output to get the batch dimension back
     transcoder_out = transcoder_acts.sae_out.view(output.shape)
     # have to unnormalize output
-    transcoder_out_constant = output.norm(dim=2, keepdim=True)[0]
+    transcoder_out_constant = torch.ones_like(output.norm(dim=2, keepdim=True)[0])
     output_norm[module_name] = transcoder_out_constant
     error = output - transcoder_out * output_norm[module_name]
 
     skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
     activations = transcoder_acts.latent_acts * transcoder_out_constant
-    transcoder_activations[module_name] = (activations, transcoder_acts.latent_indices)
+    transcoder_activations[module_name] = (
+        activations,
+        transcoder_acts.latent_indices,
+    )
 
     skip_connections[module_name] = skip[0] * transcoder_out_constant
     errors[module_name] = error[0]
+
+# def get_mlp_hook(module, input, output):
+
+#     if isinstance(input, tuple):
+#         input = input[0]
+
+#     module_name = module_to_name[module]
+#     transcoder = transcoders[module_name]
+#     # have to reshape input to lose the batch dimension
+#     input = input.view(-1, input.shape[-1])
+#     # have to normalize input
+#     input_norm[module_name] = input.norm(dim=1, keepdim=True)
+#     input = input / input_norm[module_name]
+#     transcoder_acts = transcoder(input)
+#     # have to reshape output to get the batch dimension back
+#     transcoder_out = transcoder_acts.sae_out.view(output.shape)
+#     # have to unnormalize output
+#     transcoder_out_constant = output.norm(dim=2, keepdim=True)[0]
+#     output_norm[module_name] = transcoder_out_constant
+#     error = output - transcoder_out * output_norm[module_name]
+
+#     skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
+#     activations = transcoder_acts.latent_acts * transcoder_out_constant
+#     transcoder_activations[module_name] = (activations, transcoder_acts.latent_indices)
+
+#     skip_connections[module_name] = skip[0] * transcoder_out_constant
+#     errors[module_name] = error[0]
 
 
 last_layer_activations = []

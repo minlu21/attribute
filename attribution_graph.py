@@ -5,7 +5,6 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 import json
 import numpy as np
-import random
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -25,10 +24,10 @@ class Node:
     id: str
     layer_index: int
     token_position: int
-    
+
     def to_dict(self):
         """Returns a dictionary representation of the node that can be serialized to JSON.
-        
+
         Args:
             exclude_attrs: List of attribute names to exclude from the representation
         """
@@ -37,7 +36,7 @@ class Node:
         for key, value in self.__dict__.items():
             if key in exclude_attrs:
                 continue
-                
+
             if isinstance(value, torch.Tensor):
                 temp = value.detach().cpu().to(dtype=torch.float32).numpy().tolist()
                 if isinstance(temp, list):
@@ -46,7 +45,7 @@ class Node:
                     repr_dict[key] = round(temp, 4)
             else:
                 repr_dict[key] = value
-                
+
         repr_dict["node_type"] = self.__class__.__name__
         return repr_dict
 
@@ -63,14 +62,18 @@ class Contribution:
             "target": self.target.to_dict(),
             "contribution": self.contribution
         }
-    
+
 
 @dataclass
 class Path:
     contributions: list[Contribution]
     @property
     def total_contribution(self):
-        return sum([contribution.contribution for contribution in self.contributions])
+        # return sum([contribution.contribution for contribution in self.contributions])
+        result = 1
+        for contribution in self.contributions:
+            result *= contribution.contribution
+        return result
     @property
     def id(self):
         return "->".join([contribution.source.id for contribution in self.contributions])
@@ -96,7 +99,7 @@ class OutputNode(Node):
 class InputNode(Node):
     token_str: str
     output_vector: Tensor
-    
+
 @dataclass
 class IntermediateNode(Node):
     feature_index: int
@@ -136,7 +139,7 @@ class Edge:
 
 
 class AttributionGraph:
-    
+
     def __init__(self,
                  model:torch.nn.Module,
                  tokenizer:AutoTokenizer,
@@ -178,7 +181,7 @@ class AttributionGraph:
         # I want to have a 2D array, where the first dimension is the layer,
         # the second is the token position and then each of these can have a list of nodes
         self.nodes_by_layer_and_token : dict[int,dict[int,list[Node]]] = {}
-        
+
     def save_graph(self):
         node_edges = {}
         for path in self.paths:
@@ -195,7 +198,7 @@ class AttributionGraph:
             edge = Edge(id=edge_id, source=self.nodes[source], target=self.nodes[target], weight=weight)
             self.edges[edge_id] = edge
 
-        
+
         dict_repr = {
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "edges": [edge.to_dict() for edge in self.edges.values()],
@@ -203,10 +206,10 @@ class AttributionGraph:
         }
         with open("attribution_graph.json", "w") as f:
             json.dump(dict_repr, f)
-                    
+
 
     def initialize_graph(self):
-        num_layers = len(self.transcoders) 
+        num_layers = len(self.transcoders)
         seq_len = self.input_ids.shape[0]
         self.nodes_by_layer_and_token = {layer: {token: [] for token in range(seq_len)} for layer in range(num_layers)}
 
@@ -226,11 +229,11 @@ class AttributionGraph:
             #TODO: this assumes that the keys are model.layers.i
             layer_index = int(key.split(".")[2])
             hookpoint = key
-            
+
             for token_position, (top_acts, top_indices) in enumerate(zip(activations_tensor, indices_tensor)):
-                
+
                 for act, index in zip(top_acts, top_indices):
-                    
+
                     decoder_direction = self.transcoders[hookpoint].W_dec[index,:]
                     encoder_direction = self.transcoders[hookpoint].encoder.weight[index,:]
                     intermediate_node = IntermediateNode(id=f"intermediate_{token_position}_{layer_index}_{index}",
@@ -279,14 +282,14 @@ class AttributionGraph:
                                                       output_vector=output_vector)
                         self.nodes[attention_node.id] = attention_node
                         self.nodes_by_layer_and_token[layer_index][source_token_position].append(attention_node)
-                        
+
         # Create the output node
         # Top 10 logits
         with torch.no_grad():
             probabilities = torch.nn.functional.softmax(self.logits[0,-1,:],dim=0)
         top_10_indices = torch.argsort(probabilities,descending=True)[:10]
         top_10_probabilities = probabilities[top_10_indices]
-        total_probability = 0 
+        total_probability = 0
         for i in range(10):
             before_gradient = (self.logits[0,-1,top_10_indices[i]]-torch.mean(self.logits[0,-1,:]))
             before_gradient.backward(retain_graph=True)
@@ -306,8 +309,8 @@ class AttributionGraph:
             total_probability += top_10_probabilities[i]
             if total_probability > 0.95:
                 break
-        
-        
+
+
     def compute_weighted_attention_head_contribution(self):
         weighted_attention_head_contribution = []
         # We can store attention contribution instead of all the patterns and values
@@ -338,9 +341,9 @@ class AttributionGraph:
             wV = self.model.model.layers[layer_index].self_attn.v_proj.weight.to(attention_pattern.device)
             # TODO: this is 3 for smoLLM but we should get the correct number of key value heads
             wV = torch.repeat_interleave(wV,3,dim=0)
-            # reshape to be n_heads d_model d_head 
+            # reshape to be n_heads d_model d_head
             wV = wV.reshape(attn_values.shape[1],wV.shape[1],-1)
-            
+
             #head d_head d_model, head d_model d_head -> head d_model d_model
             OV = torch.einsum(
                 'h f m, h n f -> h n m',
@@ -350,7 +353,7 @@ class AttributionGraph:
 
         self.weighted_attention_head_contribution = weighted_attention_head_contribution
         self.OVs = OVs
- 
+
 
     def layer_norm_constant(self,vector:Tensor,layer_index:int,token_position:int,is_ln2:bool=False) -> Tensor:
         if is_ln2:
@@ -359,16 +362,16 @@ class AttributionGraph:
         else:
             ln = self.first_ln[f"model.layers.{layer_index}"][0,token_position]
             pre_ln = self.pre_first_ln[f"model.layers.{layer_index}"][0,token_position]
-        # like in transformer circuits 
+        # like in transformer circuits
         if torch.dot(vector, pre_ln) == 0:
             return torch.tensor(0.)
         return torch.dot(vector, ln)/torch.dot(vector, pre_ln)
         #return torch.norm(ln)/torch.norm(pre_ln)
         # TODO: should it be torch.norm(ln)/torch.norm(pre_ln)?
-        
-    def compute_mlp_node_contribution(self, node:Node, 
-                                      target_node:Node, 
-                                      vector:Tensor, 
+
+    def compute_mlp_node_contribution(self, node:Node,
+                                      target_node:Node,
+                                      vector:Tensor,
                                       ) -> Contribution:
                 layer_index = node.layer_index
                 token_position = node.token_position
@@ -383,15 +386,15 @@ class AttributionGraph:
                 if isinstance(node,IntermediateNode):
                     contribution_vector = dot_product * node.input_vector
                     ln_constant = self.layer_norm_constant(contribution_vector,
-                                                           layer_index, 
+                                                           layer_index,
                                                            token_position, is_ln2=True)
-                    contribution_vector = contribution_vector * ln_constant 
-               
+                    contribution_vector = contribution_vector * ln_constant
+
                 else:
                     contribution_vector = torch.zeros_like(node.output_vector)
 
                 return Contribution(source=node,
-                                  target=target_node, 
+                                  target=target_node,
                                   contribution=attribution.item(),
                                   vector=contribution_vector)
     def mlp_contribution(self, last_contribution:Contribution, layer_index:int) -> list[Contribution]:
@@ -414,23 +417,23 @@ class AttributionGraph:
                 contribution_direction,
             )
             contributions.append(new_contribution)
-                
+
         return contributions
 
 
-    def compute_node_head_contribution(self, node:Node, 
-                                      target_node:Node, 
+    def compute_node_head_contribution(self, node:Node,
+                                      target_node:Node,
                                       vector:Tensor) -> Contribution:
             assert isinstance(node, AttentionNode)
             head = node.head
             token_position = node.token_position
             layer_index = node.layer_index
-            
+
             #how much is the node contributing to the upstream node
-            
+
             dot_product = torch.dot(vector,node.output_vector)
-            attribution = dot_product 
-            
+            attribution = dot_product
+
             # attention feature vector
             contribution_vector = node.input_vector@vector
             ln_constant = self.layer_norm_constant(contribution_vector,
@@ -443,14 +446,14 @@ class AttributionGraph:
                                             contribution=attribution.item(),
                                             vector=contribution_vector,
                                             head=head)
-            
+
             return new_contribution
 
 
     def attention_contribution(self,last_contribution:Contribution,layer_index:int) -> list[Contribution]:
-        
+
         contribution_direction = last_contribution.vector
-        
+
         # the previous source is the new target
         token_position = last_contribution.source.token_position
         target_node = last_contribution.source
@@ -464,13 +467,13 @@ class AttributionGraph:
             all_nodes = nodes_dict[tok]
             attention_nodes = [node for node in all_nodes if isinstance(node, AttentionNode)]
             nodes.extend(attention_nodes)
-        
+
         contributions = []
 
         weighted_attention_head_contribution = self.weighted_attention_head_contribution[layer_index]
         contrib = weighted_attention_head_contribution[0,:,token_position,:]@contribution_direction
-        # get the top 10 contributions, 
-        # TODO: we can potentially remove this part 
+        # get the top 10 contributions,
+        # TODO: we can potentially remove this part
         _, top_attn_contrib_indices_flattened = torch.topk(contrib.flatten(), k=min([50, len(contrib)]))
         top_attn_contrib_indices = np.array(np.unravel_index(top_attn_contrib_indices_flattened.cpu().numpy(), contrib.shape)).T.tolist()
         for node in tqdm(nodes,desc="Computing Node contributions",disable=True):
@@ -482,10 +485,10 @@ class AttributionGraph:
                                 contribution_direction)
                 contributions.append(new_contribution)
         return  contributions
-        
+
     @torch.no_grad()
     def flow_once(self,queue:list[Path]=[]):
-        
+
         # if the queue is empty, get the output node with the highest probability
         # TODO: handle the other output nodes
         if len(queue) == 0:
@@ -510,14 +513,14 @@ class AttributionGraph:
         for layer in tqdm(range(max_layer),desc=f"Computing MLP contributions of node {target_node.id}",disable=True):
             contributions = self.mlp_contribution(last_contribution,layer)
             all_mlp_contributions.extend(contributions)
-           
+
         all_attn_contributions = []
         if isinstance(last_contribution.source, IntermediateNode):
             max_layer += 1
         for layer in tqdm(range(max_layer),desc=f"Computing attention contributions of node {target_node.id}",disable=True):
             contributions = self.attention_contribution(last_contribution,layer)
             all_attn_contributions.extend(contributions)
-        
+
         # embedding contribution
         embed_node = [node for node in self.nodes_by_layer_and_token[0][target_node.token_position] if isinstance(node, InputNode)][0]
         contribution = torch.dot(last_contribution.vector,embed_node.output_vector).item()
@@ -526,7 +529,7 @@ class AttributionGraph:
                                               target=target_node,
                                               contribution=contribution,
                                               vector=vector)
-        
+
         all_contributions = all_mlp_contributions + all_attn_contributions + [embedding_contribution]
         all_contributions.sort(key=lambda x: x.contribution, reverse=True)
 
@@ -544,7 +547,7 @@ class AttributionGraph:
                 break
         # sometimes sort by total contribution
         # if random.random() < 0.1:
-        #     new_paths.sort(key=lambda x: x.total_contribution, reverse=True) 
+        #     new_paths.sort(key=lambda x: x.total_contribution, reverse=True)
         # else:
         #     # the other times sort by the past contribution
         #     new_paths.sort(key=lambda x: abs(x.contributions[-1].contribution), reverse=True)
@@ -557,14 +560,13 @@ class AttributionGraph:
         queue = []
         for _ in range(num_iterations):
             print(f"Iteration {_}")
-            
+
             queue = self.flow_once(queue)
             print(f"Queue has {len(queue)} paths")
             top_5_queue = queue[:20]
-            print(f"Top 5 queue:")
+            print("Top 5 queue:")
             for path in top_5_queue:
                 print(f"Path: {path.id} with contribution: {path.total_contribution}")
             # every 10 iterations, save the graph
             if _ % 10 == 0:
                 self.save_graph()
-            
