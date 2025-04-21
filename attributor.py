@@ -1,10 +1,13 @@
+#%%
+%env CUDA_VISIBLE_DEVICES=1
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sparsify.sparse_coder import SparseCoder
 
-from attribution_graph import AttributionGraph
+from attribute.mlp_attribution import AttributionGraph
 
+import fire
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -39,7 +42,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -48,20 +50,16 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def rotary_llama(x, position_ids, inv_freq, attention_scaling):
+def rotary_llama(x,position_ids,inv_freq,attention_scaling):
     inv_freq_expanded = inv_freq[None, :, None].float().expand(1, -1, 1).to(x.device)
     position_ids_expanded = position_ids[:, None, :].float()
 
     with torch.autocast(device_type="cuda", enabled=False):  # Force float32
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(
-            1, 2
-        )
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos() * attention_scaling
         sin = emb.sin() * attention_scaling
@@ -72,20 +70,23 @@ def rotary_llama(x, position_ids, inv_freq, attention_scaling):
 model_name = "HuggingFaceTB/SmolLM2-135M"
 dataset = "EleutherAI/fineweb-edu-dedup-10b"
 split = "train"
+prompt = "When John and Mary went to the store, John gave a bag to"
+
 
 
 model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    device_map={"": "cuda:0"},
-    torch_dtype=torch.bfloat16,
-)
+        model_name,
+        device_map={"": "cuda:0"},
+        torch_dtype=torch.bfloat16,
+
+    )
 
 # dataset = load_dataset(
 #                 dataset,
 #                 split=split)
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-# model = LanguageModel(model_name)
+#model = LanguageModel(model_name)
 # dataset = chunk_and_tokenize(
 #     dataset,
 #     tokenizer,
@@ -102,26 +103,21 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 # )
 
 transcoders = {}
-hookpoints_mlp = [
-    f"model.layers.{i}.mlp" for i in range(model.config.num_hidden_layers)
-]  # Use model config for layer count
+hookpoints_mlp = [f"model.layers.{i}.mlp" for i in range(model.config.num_hidden_layers)] # Use model config for layer count
 for hookpoint in hookpoints_mlp:
     temp_hookpoint = hookpoint.replace("model.layers.", "layers.")
     sae = SparseCoder.load_from_disk(
-        f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x_normalized/{temp_hookpoint}",
-        device="cuda",
-    )
+                f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x_normalized/{temp_hookpoint}",
+                device="cuda",
+            )
     transcoders[hookpoint] = sae
-prompt = "When John and Mary went to the store, John gave a bag to"
-# prompt = "Cow Cow Fish Fish Cat"
+#prompt = "Cow Cow Fish Fish Cat"
 
 attn_values = {}
 first_ln = {}
 pre_first_ln = {}
 second_ln = {}
 pre_second_ln = {}
-
-
 def get_attention_values_hook(module, input, output):
     # this hook is in the layer
     residual = input[0]
@@ -133,25 +129,19 @@ def get_attention_values_hook(module, input, output):
     input_shape = layer_normed.shape[:-1]
     hidden_shape = (*input_shape, -1, module.self_attn.head_dim)
 
-    value_states = (
-        module.self_attn.v_proj(layer_normed).view(hidden_shape).transpose(1, 2)
-    )
+    value_states = module.self_attn.v_proj(layer_normed).view(hidden_shape).transpose(1, 2)
     values = repeat_kv(value_states, 3)
     attn_values[module_to_name[module]] = values
-
 
 def get_ln2_hook(module, input, output):
     pre_second_ln[module_to_name[module]] = input[0]
     second_ln[module_to_name[module]] = output
-
 
 transcoder_activations = {}
 errors = {}
 skip_connections = {}
 input_norm = {}
 output_norm = {}
-
-
 def get_mlp_hook(module, input, output):
 
     if isinstance(input, tuple):
@@ -168,34 +158,25 @@ def get_mlp_hook(module, input, output):
     # have to reshape output to get the batch dimension back
     transcoder_out = transcoder_acts.sae_out.view(output.shape)
     # have to unnormalize output
-    transcoder_out_constant = output.norm(dim=2, keepdim=True)[0]
+    transcoder_out_constant =  output.norm(dim=2, keepdim=True)[0]
     output_norm[module_name] = transcoder_out_constant
-    error = output - transcoder_out * output_norm[module_name]
+    error = output - transcoder_out*output_norm[module_name]
 
-    skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
-    activations = transcoder_acts.latent_acts * transcoder_out_constant
+    skip = (input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT)
+    activations = transcoder_acts.latent_acts*transcoder_out_constant
     transcoder_activations[module_name] = (activations, transcoder_acts.latent_indices)
 
-    skip_connections[module_name] = skip[0] * transcoder_out_constant
+    skip_connections[module_name] = skip[0]*transcoder_out_constant
     errors[module_name] = error[0]
+# last_layer_activations = []
+# def get_last_layer_hook(module, input, output):
 
-
-last_layer_activations = []
-
-
-def get_last_layer_hook(module, input, output):
-
-    last_layer_activations.append(output[0])
-
+#     last_layer_activations.append(output[0])
 
 hookpoints_layer = [f"model.layers.{i}" for i in range(model.config.num_hidden_layers)]
-hookpoints_ln = [
-    f"model.layers.{i}.post_attention_layernorm"
-    for i in range(model.config.num_hidden_layers)
-]
+hookpoints_ln = [f"model.layers.{i}.post_attention_layernorm" for i in range(model.config.num_hidden_layers)]
 name_to_module = {
-    name: model.get_submodule(name)
-    for name in hookpoints_layer + hookpoints_mlp + hookpoints_ln
+            name: model.get_submodule(name) for name in hookpoints_layer + hookpoints_mlp + hookpoints_ln
 }
 module_to_name = {v: k for k, v in name_to_module.items()}
 for name, module in name_to_module.items():
@@ -208,31 +189,33 @@ for name, module in name_to_module.items():
 
 
 tokenized_prompt = tokenizer(prompt, return_tensors="pt").to("cuda:0")
-outputs = model(**tokenized_prompt, output_attentions=True, output_hidden_states=True)
+outputs = model(**tokenized_prompt,output_attentions=True,output_hidden_states=True)
 attention_patterns = outputs.attentions
 logits = outputs.logits
 last_layer_activations = outputs.hidden_states[-1]
 last_layer_activations.retain_grad()
 
-# exit()
-attribution_graph = AttributionGraph(
-    model,
-    tokenizer,
-    transcoders,
-    tokenized_prompt["input_ids"][0],
-    attention_patterns,
-    first_ln,
-    pre_first_ln,
-    second_ln,
-    pre_second_ln,
-    input_norm,
-    output_norm,
-    attn_values,
-    transcoder_activations,
-    errors,
-    skip_connections,
-    logits,
-    last_layer_activations,
-)
+#%%
+%load_ext autoreload
+%autoreload 2
+#exit()
+attribution_graph = AttributionGraph(model,
+                    tokenizer,
+                    transcoders,
+                    tokenized_prompt["input_ids"][0],
+                    attention_patterns,
+                    first_ln,pre_first_ln,second_ln,pre_second_ln,
+                    input_norm,
+                    output_norm,
+                    attn_values,
+                    transcoder_activations,
+                    errors,
+                    skip_connections,
+                    logits,
+                    last_layer_activations,
+                    [
+                        transcoders[module].W_skip for module in hookpoints_mlp
+                    ])
 attribution_graph.initialize_graph()
 attribution_graph.flow()
+#%%

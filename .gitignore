@@ -3,3 +3,4 @@ lib
 results
 .vscode
 __pycache__
+*.json

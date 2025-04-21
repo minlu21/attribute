@@ -1,13 +1,9 @@
 import asyncio
-import os
-from functools import partial
 from pathlib import Path
 from typing import Callable
 
-import orjson
 import torch
 from simple_parsing import ArgumentParser
-from torch import Tensor
 from transformers import (
     AutoModel,
     AutoTokenizer,
@@ -18,15 +14,9 @@ from transformers import (
 )
 
 
-from delphi.clients import Offline, OpenRouter
 from delphi.config import RunConfig
-from delphi.explainers import DefaultExplainer, ContrastiveExplainer
-from delphi.latents import LatentCache, LatentDataset
-from delphi.latents.neighbours import NeighbourCalculator
-from delphi.log.result_analysis import log_results
-from delphi.pipeline import Pipe, Pipeline, process_wrapper
-from delphi.scorers import DetectionScorer, FuzzingScorer
-from delphi.sparse_coders import load_hooks_sparse_coders, load_sparse_coders
+from delphi.latents import LatentCache
+from delphi.sparse_coders import load_hooks_sparse_coders
 
 from delphi.utils import assert_type, load_tokenized_data
 
@@ -57,7 +47,6 @@ def load_artifacts(run_cfg: RunConfig):
     )
 
     return run_cfg.hookpoints, hookpoint_to_sparse_encode, model, transcode
-
 
 
 def populate_cache(
@@ -101,7 +90,8 @@ def populate_cache(
         batch_size=cache_cfg.batch_size,
         transcode=transcode,
     )
-    cache.run(cache_cfg.n_tokens, tokens)
+    with torch.autocast("cuda"):
+        cache.run(cache_cfg.n_tokens, tokens)
 
     cache.save_splits(
         # Split the activation and location indices into different files to make
@@ -146,18 +136,15 @@ async def run(
     run_cfg: RunConfig,
 ):
     base_path = Path.cwd() / "results"
-   
+
     base_path = base_path / run_cfg.name
-    
 
     base_path.mkdir(parents=True, exist_ok=True)
 
     run_cfg.save_json(base_path / "run_config.json", indent=4)
 
-   
-    latents_path = base_path / "latents" 
+    latents_path = base_path / "latents"
 
-    
     hookpoints, hookpoint_to_sparse_encode, model, transcode = load_artifacts(run_cfg)
     tokenizer = AutoTokenizer.from_pretrained(run_cfg.model, token=run_cfg.hf_token)
 
@@ -176,8 +163,6 @@ async def run(
             tokenizer,
             transcode,
         )
-
-    
 
 
 if __name__ == "__main__":
