@@ -15,7 +15,10 @@ from .nodes import (
 from .caching import TranscodedModel, TranscodedOutputs
 from typing import Optional
 import random
-from .utils import measure_time, infcache
+from .utils import measure_time, infcache, cantor
+from pathlib import Path
+import json
+import os
 
 
 @dataclass
@@ -107,6 +110,14 @@ class AttributionConfig:
     pre_filter_threshold: float = 1e-2
     top_k_edges: int = 64
 
+    # always keep nodes above this threshold of influence
+    node_threshold = 1e-2
+    # keep per_layer_position nodes above this threshold for each layer/position pair
+    secondary_threshold = 1e-4
+    per_layer_position = 2
+    # keep edges above this threshold
+    edge_threshold = 1e-3
+
 
 class AttributionGraph:
 
@@ -144,9 +155,146 @@ class AttributionGraph:
     def logits(self):
         return self.cache.logits[0]
 
-    def save_graph(self):
-        # TODO
-        pass
+    def save_graph(self, save_dir: os.PathLike):
+        save_dir = Path(save_dir)
+        print("Saving graph to", save_dir)
+
+        print("Deduplicating nodes")
+        dedup_node_names = set()
+        for edge in self.edges.values():
+            if edge.weight == 0:
+                continue
+            dedup_node_names.add(edge.source.id)
+            dedup_node_names.add(edge.target.id)
+        dedup_node_names = list(dedup_node_names)
+        dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
+
+        print("Finding adjacency matrix")
+        n_initial = len(dedup_node_names)
+        adj_matrix = np.zeros((n_initial, n_initial))
+        for edge in self.edges.values():
+            target_index = dedup_node_indices[edge.target.id]
+            source_index = dedup_node_indices[edge.source.id]
+            adj_matrix[target_index, source_index] = abs(edge.weight)
+        adj_matrix /= np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
+
+        print("Finding influence matrix")
+        if not hasattr(self, "influence"):
+            identity = np.eye(n_initial)
+            influence = np.linalg.inv(identity - adj_matrix) - identity
+            self.influence = influence
+        else:
+            influence = self.influence
+
+        influence_sources = np.zeros((n_initial,))
+        for index, node in enumerate(dedup_node_names):
+            node = self.nodes[node]
+            if not isinstance(node, OutputNode):
+                continue
+            influence_sources[index] = node.probability
+        usage = influence_sources @ influence
+
+        selected_nodes = [node for i, node in enumerate(dedup_node_names)
+                  if self.nodes[node].node_type in ("InputNode", "OutputNode", "ErrorNode")]
+        for seq_idx in range(self.cache.input_ids.shape[-1]):
+            for layer_idx in range(self.model.num_layers):
+                matching_nodes = [
+                    node for node in dedup_node_names
+                    if self.nodes[node].layer_index == layer_idx
+                    and self.nodes[node].token_position == seq_idx
+                    and node not in selected_nodes
+                ]
+                matching_nodes.sort(key=lambda x: usage[dedup_node_indices[x]], reverse=True)
+                matching_nodes = matching_nodes[:self.config.per_layer_position] + [
+                    node
+                    for node in matching_nodes[self.config.per_layer_position:]
+                    if usage[dedup_node_indices[node]] > self.config.node_threshold
+                ]
+                matching_nodes = [
+                    node for node in matching_nodes
+                    if usage[dedup_node_indices[node]] > self.config.secondary_threshold
+                ]
+                selected_nodes.extend(matching_nodes)
+
+        export_nodes = []
+        for n in selected_nodes:
+            export_nodes.append(self.nodes[n])
+
+        export_edges = []
+        for edge in self.edges.values():
+            if not (edge.source.id in selected_nodes and edge.target.id in selected_nodes):
+                continue
+            if abs(influence[dedup_node_indices[edge.target.id], dedup_node_indices[edge.source.id]]) < self.config.edge_threshold:
+                continue
+            export_edges.append(edge)
+
+        tokens = [self.model.decode_token(i) for i in self.input_ids]
+        name = "test-1"
+        # prefix = ["<EOT>"]
+        prefix = []
+        scan = "default"
+        metadata = dict(
+            slug=name,
+            # scan="jackl-circuits-runs-1-4-sofa-v3_0",
+            scan=scan,
+            prompt_tokens=prefix + tokens,
+            prompt="".join(tokens),
+            title_prefix="",
+            n_layers=self.model.num_layers,
+        )
+
+        nodes_json = [
+            dict(
+                feature_type=dict(
+                    IntermediateNode="cross layer transcoder",
+                    OutputNode="logit",
+                    InputNode="embedding",
+                    ErrorNode="mlp reconstruction error",
+                )[node.node_type],
+                layer=(str(node.layer_index)
+                if node.layer_index != self.model.num_layers else "-1")
+                if node.layer_index != -1 else "E",
+                node_id=node.id_js,
+                jsNodeId=node.id_js + "-0",
+                feature=int(node.feature_index) if hasattr(node, "feature_index") else None,
+                ctx_idx=node.token_position + len(prefix),
+                run_idx=0, reverse_ctx_idx=0,
+                clerp="" if not isinstance(node, OutputNode) else f"output: \"{node.token_str}\" (p={node.probability:.3f})",
+                token_prob=0.0 if not isinstance(node, OutputNode) else node.probability,
+                is_target_logit=False,
+            ) for node in export_nodes
+        ]
+
+        for node in nodes_json:
+            if node["feature_type"] != "cross layer transcoder":
+                continue
+            layer, feature = int(node["layer"]), int(node["feature"])
+            idx_cantor = cantor(layer, feature)
+            node["feature"] = idx_cantor
+
+        links_json = [
+            e.to_dict() for e in export_edges
+        ]
+
+        result = dict(
+            metadata=metadata,
+            nodes=nodes_json,
+            links=links_json,
+            qParams=dict(
+                linkType="both",
+                # # node IDs
+                # pinnedIds=[],
+                # # clickedId=export_nodes[0].id,
+                # clickedId=None,
+                # supernodes=[],
+                # # x/y position pairs for supernodes, separated by spaces
+                # sg_pos="",
+            )
+        )
+
+        open(save_dir / "graph_data" / f"{name}.json", "w").write(json.dumps(result))
+        open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=[metadata])))
+
 
     def initialize_graph(self):
         num_layers = self.num_layers
