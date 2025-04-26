@@ -1,11 +1,11 @@
 from dataclasses import dataclass, replace
 import torch
 from typing import Optional
-from heapq import heappush, heappop
 from functools import lru_cache
 from torch import Tensor
 from transformers import AutoTokenizer
 from tqdm import tqdm
+import random
 import json
 import numpy as np
 import time
@@ -22,7 +22,7 @@ def measure_time(name: str, disabled: bool = False):
     yield
     end_time = time.time()
     elapsed_time = end_time - start_time
-    if not disabled:
+    if not disabled or True:
         print(f"{name}: {elapsed_time:.4f} seconds")
 
 
@@ -45,6 +45,10 @@ class Node:
     id: str
     layer_index: int
     token_position: int
+
+    @property
+    def id_js(self):
+        return self.id
 
     def to_dict(self):
         """Returns a dictionary representation of the node that can be serialized to JSON.
@@ -69,8 +73,12 @@ class Node:
             else:
                 repr_dict[key] = value
 
-        repr_dict["node_type"] = self.__class__.__name__
+        repr_dict["node_type"] = self.node_type
         return repr_dict
+
+    @property
+    def node_type(self):
+        return self.__class__.__name__
 
 
 @dataclass
@@ -93,16 +101,16 @@ class QueueElement:
     @property
     @infcache
     def key(self):
-        key = self.contribution ** (1 / len(self.sequence))
+        key = self.contribution  # ** (1 / len(self.sequence))
         if isinstance(self.source, IntermediateNode):
             key *= abs(self.source.activation)
-        return -key
+        return -abs(key)
 
     def __lt__(self, other):
         return self.key < other.key
 
     def __eq__(self, other):
-        return self.key == other.key
+        return self.source.id == other.source.id
 
     @property
     @infcache
@@ -112,6 +120,50 @@ class QueueElement:
             return own
         else:
             return own + self.parent.sequence
+
+
+class NodeQueue:
+    def __init__(self):
+        self.visited = set()
+        self.unvisited = {}
+
+    def __len__(self):
+        return len(self.unvisited)
+
+    def pop(self):
+        all_layers = set(x.source.layer_index for x in self.unvisited.values())
+        random_layer = random.choice(list(all_layers))
+        unvisited = {x: y for x, y in self.unvisited.items() if y.source.layer_index == random_layer}
+        highest = min(unvisited, key=lambda x: self.unvisited[x].key)
+        if highest in self.visited:
+            del self.unvisited[highest]
+            return self.pop()
+        return self.unvisited.pop(highest)
+
+    def add(self, node: QueueElement):
+        if node.source.id in self.visited:
+            return
+        if node.source.id in self.unvisited:
+            if node.key < self.unvisited[node.source.id].key:
+                self.unvisited[node.source.id] = node
+        else:
+            self.unvisited[node.source.id] = node
+
+    def add_many(self, nodes: list[QueueElement], top_k: int = float("inf")):
+            with measure_time("Deduplicating", disabled=True):
+                new_sources = [x for x in nodes if x.source.id not in self.visited]
+            with measure_time("Creating keys to sort", disabled=True):
+                keys = [float(x.key) for x in new_sources]
+            with measure_time("Sorting", disabled=True):
+                if len(keys) > top_k:
+                    topk_sort = np.argpartition(keys, top_k)[:top_k]
+                else:
+                    topk_sort = np.arange(len(keys))
+                filtered_sources = [new_sources[i] for i in topk_sort]
+            with measure_time("Adding to queue", disabled=True):
+                for source in filtered_sources:
+                    self.add(source)
+
 
 
 @dataclass
@@ -215,6 +267,12 @@ class Edge:
         }
 
 
+@dataclass
+class AttributionConfig:
+    pre_filter_threshold: float = 1e-2
+    top_k_edges: int = 64
+
+
 class AttributionGraph:
 
     def __init__(
@@ -237,7 +295,9 @@ class AttributionGraph:
         logits: Tensor,
         last_layer_activations: Tensor,
         W_skip: list[Tensor],
+        config: AttributionConfig = AttributionConfig()
     ):
+        self.config = config
         self.model = model
         self.tokenizer = tokenizer
         self.transcoders = transcoders
@@ -335,7 +395,7 @@ class AttributionGraph:
                     intermediate_node = IntermediateNode(
                         id=f"intermediate_{token_position}_{layer_index}_{index}",
                         layer_index=layer_index,
-                        feature_index=index,
+                        feature_index=int(index),
                         token_position=token_position,
                         activation=float(act),
                         input_vector=encoder_direction.to(dtype=torch.bfloat16),
@@ -364,6 +424,7 @@ class AttributionGraph:
         top_10_indices = torch.argsort(probabilities, descending=True)[:10]
         top_10_probabilities = probabilities[top_10_indices]
         total_probability = 0
+        output_nodes = []
         for i in range(10):
             before_gradient = self.logits[0, -1, top_10_indices[i]] - torch.mean(
                 self.logits[0, -1, :]
@@ -384,9 +445,11 @@ class AttributionGraph:
                 layer_index=len(self.transcoders),
             )
             self.nodes[output_node.id] = output_node
+            output_nodes.append(output_node)
             total_probability += top_10_probabilities[i]
             if total_probability > 0.95:
                 break
+        self.output_nodes = output_nodes
 
     def compute_weighted_attention_head_contribution(self):
         weighted_attention_head_contribution = []
@@ -465,13 +528,8 @@ class AttributionGraph:
         target_node: Node,
         vector: Tensor,
     ) -> Contribution:
-        if isinstance(node, IntermediateNode):
-            activation = node.activation
-        else:
-            activation = 1
-
         dot_product = torch.dot(vector, node.output_vector)
-        attribution = activation * dot_product
+        attribution = dot_product
 
         return Contribution(
             source=node,
@@ -534,20 +592,23 @@ class AttributionGraph:
         similarities = torch.einsum(
             "...fd,...d->...f",
             w_dec[indices]
-            # * activations[..., None]
+            * activations[..., None]
             , contribution)
-        time_idx, feature_idx = torch.nonzero(similarities.abs() >= 1e-2, as_tuple=True)
+        time_idx, feature_idx = torch.nonzero(similarities.abs() >= self.config.pre_filter_threshold, as_tuple=True)
         time_idx, feature_idx = time_idx.tolist(), feature_idx.tolist()
         sims = similarities[time_idx, feature_idx].tolist()
-        for t, f, s in zip(time_idx, feature_idx, sims):
-            source = self.nodes_by_layer_and_token[layer_index][t][f]
+        indexes = indices[time_idx, feature_idx]
+        for t, f, s, i in zip(time_idx, feature_idx, sims, indexes):
+            # source = self.nodes_by_layer_and_token[layer_index][t][f]
+            source = self.nodes[f"intermediate_{t}_{layer_index}_{i}"]
+
             # if abs(s) > 2 and contribution.norm(dim=-1).abs().max() < 2:
             #     print(contribution.norm(dim=-1))
             #     print(self.compute_mlp_node_contribution(source, None, contribution[t]).contribution, s)
             contributions.append(Contribution(
                 source=source,
                 target=None,
-                contribution=s
+                contribution=s / source.activation
             ))
         return [
             replace(contribution, contribution=float(contribution.contribution))
@@ -716,7 +777,7 @@ class AttributionGraph:
 
     @torch.no_grad()
     @torch.autocast("cuda")
-    def flow_once(self, queue: list[QueueElement] = [], taboo: set[str] = set()):
+    def flow_once(self, queue: NodeQueue, output_nodes: list[OutputNode]):
 
         with measure_time(
             "Finding a node to compute contributions",
@@ -724,29 +785,15 @@ class AttributionGraph:
         ):
             # if the queue is empty, get the output node with the highest probability
             # TODO: handle the other output nodes
-            if len(queue) == 0:
-                output_nodes = [
-                    node for node in self.nodes.values() if isinstance(node, OutputNode)
-                ]
-                for highest_probability_node in sorted(
-                    output_nodes, key=lambda x: x.probability, reverse=True
-                ):
-                    if highest_probability_node.id not in taboo:
-                        break
-                else:
-                    print("Ran out of nodes")
-                    return []
-                taboo.add(highest_probability_node.id)
-                influence, target_node = 1, highest_probability_node
+            if len(output_nodes) > 0:
+                target_node = output_nodes.pop()
+                influence, target_node = 1, target_node
                 print("Doing output node")
                 target = None
             else:
                 # target, queue = queue[0], queue[1:]
-                target = heappop(queue)
+                target = queue.pop()
                 influence, target_node = target.contribution, target.source
-                if target_node.id in taboo:
-                    print("Skipping node")
-                    return queue
                 print(f"Doing target: {target_node.id} with influence {influence}")
                 print("Path:", [(x.source.id, x.weight) for x in target.sequence])
 
@@ -765,6 +812,9 @@ class AttributionGraph:
                         == target_node.token_position
                     )[:, None]
                 )
+            ln = self.second_ln[f"model.layers.{max_layer}.post_attention_layernorm"]
+            pre_ln = self.pre_second_ln[f"model.layers.{max_layer}.post_attention_layernorm"]
+            gradient = gradient * torch.nan_to_num(ln / pre_ln)
         all_mlp_contributions = []
         with measure_time(
             f"Computing MLP contributions of node {target_node.id}",
@@ -778,13 +828,13 @@ class AttributionGraph:
                 if layer != max_layer:
                     contributions = self.mlp_contribution(gradient, layer)
                     all_mlp_contributions.extend(contributions)
-                skipped = gradient @ self.W_skip[layer]
-                ln = self.second_ln[f"model.layers.{layer}.post_attention_layernorm"]
-                pre_ln = self.pre_second_ln[
-                    f"model.layers.{layer}.post_attention_layernorm"
-                ]
-                skipped = skipped * torch.nan_to_num(ln / pre_ln)
-                gradient = gradient + skipped
+                    skipped = gradient @ self.W_skip[layer]
+                    ln = self.second_ln[f"model.layers.{layer}.post_attention_layernorm"]
+                    pre_ln = self.pre_second_ln[
+                        f"model.layers.{layer}.post_attention_layernorm"
+                    ]
+                    skipped = skipped * torch.nan_to_num(ln / pre_ln)
+                    gradient = gradient + skipped
                 gradient = self.backward(gradient, layer)
                 # # print(layer, gradient.norm(dim=-1).mean())
 
@@ -812,38 +862,40 @@ class AttributionGraph:
             f"Summarizing contributions of node {target_node.id}",
             disabled=True,
         ):
-            # Make new paths using the last path
-            new_sources = []
-            for n_path in range(0, len(all_contributions)):
-                new_contribution = all_contributions[n_path]
-                new_source = new_contribution.source
-                edge = Edge(
-                    source=new_source,
-                    target=target_node,
-                    weight=new_contribution.contribution,
-                )
-                self.edges[edge.id] = edge
-                # if path ends with input node, error node or skip node, it is finished and we don't want to add it to the queue
-                if (
-                    isinstance(new_source, InputNode)
-                    or isinstance(new_source, ErrorNode)
-                    or isinstance(new_source, SkipNode)
-                ):
-                    continue
-                new_sources.append(
-                    QueueElement(
+            with measure_time(
+                f"Creating sources for {target_node.id}",
+                disabled=True,
+            ):
+                # Make new paths using the last path
+                new_sources = []
+                for n_path in range(0, len(all_contributions)):
+                    new_contribution = all_contributions[n_path]
+                    new_source = new_contribution.source
+                    weight = new_contribution.contribution
+                    if isinstance(new_source, IntermediateNode):
+                        weight *= new_source.activation
+                    edge = Edge(
                         source=new_source,
-                        weight=abs(new_contribution.contribution),
-                        parent=target,
+                        target=target_node,
+                        weight=weight,
                     )
-                )
+                    self.edges[edge.id] = edge
+                    # if path ends with input node, error node or skip node, it is finished and we don't want to add it to the queue
+                    if (
+                        isinstance(new_source, InputNode)
+                        or isinstance(new_source, ErrorNode)
+                        or isinstance(new_source, SkipNode)
+                    ):
+                        continue
+                    new_sources.append(
+                        QueueElement(
+                            source=new_source,
+                            weight=abs(new_contribution.contribution),
+                            parent=target,
+                        )
+                    )
 
-            existing = set(queue)
-            new_sources = [x for x in new_sources if x not in existing]
-            with measure_time("Sorting"):
-                keys = [x.key for x in new_sources]
-                topk_sort = np.argsort(keys)[:256]
-                filtered_sources = [new_sources[i] for i in topk_sort]
+            queue.add_many(new_sources, self.config.top_k_edges)
 
         # sometimes sort by total contribution
         # if random.random() < 0.1:
@@ -852,14 +904,6 @@ class AttributionGraph:
         #     # the other times sort by the past contribution
         #     new_paths.sort(key=lambda x: abs(x.contributions[-1].contribution), reverse=True)
 
-        with measure_time(
-            f"Adding new sources to queue of node {target_node.id}",
-            disabled=True,
-        ):
-            for new_source in filtered_sources:
-                if new_source.source.id in taboo:
-                    continue
-                heappush(queue, new_source)
         # queue.extend(new_sources)
         # queue.sort(key=lambda x: abs(x.contribution), reverse=True)
 
@@ -867,14 +911,14 @@ class AttributionGraph:
         return queue
 
     def flow(self, num_iterations: int = 100000):
-        queue = []
-        visited = set()
+        queue = NodeQueue()
+        output_nodes = self.output_nodes[:]
         for i in range(num_iterations):
             with measure_time(
                 f"Iteration {i}",
                 disabled=False,
             ):
-                queue = self.flow_once(queue, visited)
+                self.flow_once(queue, output_nodes)
                 print(f"Queue has {len(queue)} paths")
             if not queue:
                 print("Queue is empty")
@@ -882,4 +926,4 @@ class AttributionGraph:
             # every 10 iterations, save the graph
             # if i % 10 == 0:
                 # self.save_graph()
-        self.save_graph()
+        # self.save_graph()

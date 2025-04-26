@@ -161,16 +161,20 @@ def get_mlp_hook(module, input, output):
     transcoder_out_constant = output.norm(dim=2, keepdim=True)[0]
     output_norm[module_name] = transcoder_out_constant
     transcoder_out_constant = torch.ones_like(transcoder_out_constant)
-    error = output - transcoder_out * output_norm[module_name]
+    # error = output - transcoder_out * output_norm[module_name]
+    error = output - transcoder_out
+    print(module_name, output.norm(dim=2).mean(), transcoder_out.norm(dim=2).mean(), error.norm(dim=2).mean())
 
     skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
-    activations = transcoder_acts.latent_acts * transcoder_out_constant
+    # activations = transcoder_acts.latent_acts * transcoder_out_constant
+    activations = transcoder_acts.latent_acts
     transcoder_activations[module_name] = (
         activations,
         transcoder_acts.latent_indices,
     )
 
-    skip_connections[module_name] = skip[0] * transcoder_out_constant
+    # skip_connections[module_name] = skip[0] * transcoder_out_constant
+    skip_connections[module_name] = skip[0]
     errors[module_name] = error[0]
 # last_layer_activations = []
 # def get_last_layer_hook(module, input, output):
@@ -221,5 +225,158 @@ attribution_graph = AttributionGraph(model,
                         transcoders[module].W_skip for module in hookpoints_mlp
                     ])
 attribution_graph.initialize_graph()
-attribution_graph.flow(50_000)
+%time attribution_graph.flow(2_000)
 #%%
+edges = attribution_graph.edges
+edge_keys = [edge.partition(" -> ")[::2] for edge in edges]
+#%%
+nodes = []
+indices = {}
+for i, node in enumerate(set(x for pair in edge_keys for x in pair)):
+    nodes.append(node)
+    indices[node] = i
+# %%
+import numpy as np
+from tqdm.auto import tqdm
+matrix = np.zeros((len(nodes), len(nodes)))
+for i, edge in enumerate(tqdm(edges)):
+    source, target = edge_keys[i]
+    source_node = source.split(".")[-1]
+    matrix[indices[target], indices[source]] = abs(edges[edge].weight)
+matrix /= np.maximum(1e-2, matrix.sum(axis=1, keepdims=True))
+#%%
+from matplotlib import pyplot as plt
+def cg(x, cf=500):
+    x = x[:x.shape[0] // cf * cf, :x.shape[1] // cf * cf]
+    x = x.reshape(x.shape[0] // cf, cf, x.shape[1] // cf, cf)
+    # x = x.max(axis=1).max(axis=-1)
+    # x = x.mean(axis=1).max(axis=-1)
+    x = x.mean(axis=1).mean(axis=-1)
+    return x
+coarse = cg(matrix)
+plt.imshow(np.log10(coarse))
+# plt.imshow(np.log10(coarse) >= -2.0)
+plt.colorbar()
+plt.show()
+#%%
+sources = matrix.sum(axis=0)
+plt.plot(np.sort(sources))
+plt.yscale("log")
+#%%
+I = np.eye(len(nodes))
+%time influence = np.linalg.inv(I - matrix) - I
+#%%
+plt.imshow(np.log10(cg(np.abs(influence - matrix))))
+plt.colorbar()
+plt.show()
+# %%
+# compute logit influence
+influence_sources = np.zeros((len(nodes),))
+for index, node in enumerate(nodes):
+    if "output" not in node:
+        continue
+    influence_sources[index] = attribution_graph.nodes[node].probability
+#%%
+# usage = influence_sources @ matrix
+usage = influence_sources @ influence
+plt.plot(np.sort(usage))
+plt.yscale("log")
+#%%
+for i in usage.argsort()[-10:]:
+    print(nodes[i], usage[i])
+#%%
+node_thresold = 1e-3
+edge_threshold = 1e-3
+#%%
+# select used node names
+selected_nodes = [node for i, node in enumerate(nodes)
+                  if usage[i] > node_thresold
+                  or attribution_graph.nodes[node].node_type in ("InputNode", "OutputNode")
+                  ]
+export_nodes = []
+for n in selected_nodes:
+    export_nodes.append(attribution_graph.nodes[n])
+#%%
+export_edges = []
+for eid, e in attribution_graph.edges.items():
+    if not (e.source.id in selected_nodes or e.target.id in selected_nodes):
+        continue
+    if abs(influence[indices[e.target.id], indices[e.source.id]]) < edge_threshold:
+        continue
+    export_edges.append(e)
+#%%
+len(export_nodes), len(export_edges)
+#%%
+from pathlib import Path
+from attribute.mlp_attribution import OutputNode
+import json
+
+save_dir = Path("../attribution-graphs-frontend")
+
+tokens = [tokenizer.decode([i]) for i in tokenized_prompt["input_ids"][0].tolist()]
+name = "some-name"
+prefix = ["<EOT>"]
+metadata = dict(
+    slug=name,
+    # scan="jackl-circuits-runs-1-4-sofa-v3_0",
+    scan="some-run",
+    prompt_tokens=prefix + tokens,
+    prompt="".join(tokens),
+    title_prefix="",
+    n_layers=model.config.num_hidden_layers,
+)
+
+nodes_json = [
+    dict(
+        feature_type=dict(
+            IntermediateNode="cross layer transcoder",
+            OutputNode="logit",
+            InputNode="embedding",
+            ErrorNode="mlp reconstruction error",
+        )[node.node_type],
+        layer=(str(node.layer_index)
+        if node.layer_index != model.config.num_hidden_layers else "-1")
+        if node.layer_index != -1 else "E",
+        node_id=node.id_js,
+        jsNodeId=node.id_js + "-0",
+        feature=int(node.feature_index) if hasattr(node, "feature_index") else None,
+        ctx_idx=node.token_position + len(prefix),
+        run_idx=0, reverse_ctx_idx=0,
+        clerp="" if not isinstance(node, OutputNode) else f"output: \"{node.token_str}\" (p={node.probability:.3f})",
+        token_prob=0.0 if not isinstance(node, OutputNode) else node.probability,
+        is_target_logit=False,
+    ) for node in export_nodes
+]
+
+links_json = [
+    dict(
+        source=e.source.id,
+        target=e.target.id,
+        weight=e.weight,
+    )
+    for e in export_edges
+]
+
+result = dict(
+    metadata=metadata,
+    nodes=nodes_json,
+    links=links_json,
+    qParams=dict(
+        linkType="both",
+        # # node IDs
+        # pinnedIds=[],
+        # # clickedId=export_nodes[0].id,
+        # clickedId=None,
+        # supernodes=[],
+        # # x/y position pairs for supernodes, separated by spaces
+        # sg_pos="",
+    )
+)
+
+open(save_dir / "graph_data" / f"{name}.json", "w").write(json.dumps(result))
+open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=[metadata])))
+
+# %%
+
+{k: v.norm(dim=-1).mean() for k, v in errors.items()}
+{k: v.norm(dim=-1).mean() for k, v in errors.items()}
