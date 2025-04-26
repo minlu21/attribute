@@ -10,7 +10,7 @@ def measure_time(name: str, disabled: bool = False):
     yield
     end_time = time.time()
     elapsed_time = end_time - start_time
-    if not disabled or True:
+    if not disabled:
         print(f"{name}: {elapsed_time:.4f} seconds")
 
 
