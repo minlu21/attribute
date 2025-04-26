@@ -1,6 +1,10 @@
 from dataclasses import dataclass, replace
 import torch
 from torch import Tensor
+from collections import defaultdict
+from delphi.latents import LatentDataset
+from delphi.config import SamplerConfig, ConstructorConfig
+from natsort import natsorted
 from tqdm import tqdm
 import numpy as np
 from .nodes import (
@@ -107,7 +111,14 @@ class NodeQueue:
 
 @dataclass
 class AttributionConfig:
+    # name of the run
+    name = "test-1"
+    # ID for the model the features are from
+    scan = "default"
+
+    # remove MLP edges below this threshold
     pre_filter_threshold: float = 1e-2
+    # keep top k edges for each node
     top_k_edges: int = 64
 
     # always keep nodes above this threshold of influence
@@ -120,7 +131,6 @@ class AttributionConfig:
 
 
 class AttributionGraph:
-
     def __init__(
         self,
         model: TranscodedModel,
@@ -186,6 +196,7 @@ class AttributionGraph:
         else:
             influence = self.influence
 
+        print("Finding influence sources")
         influence_sources = np.zeros((n_initial,))
         for index, node in enumerate(dedup_node_names):
             node = self.nodes[node]
@@ -194,6 +205,7 @@ class AttributionGraph:
             influence_sources[index] = node.probability
         usage = influence_sources @ influence
 
+        print("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
                   if self.nodes[node].node_type in ("InputNode", "OutputNode", "ErrorNode")]
         for seq_idx in range(self.cache.input_ids.shape[-1]):
@@ -219,6 +231,7 @@ class AttributionGraph:
         export_nodes = []
         for n in selected_nodes:
             export_nodes.append(self.nodes[n])
+        self.exported_nodes = export_nodes
 
         export_edges = []
         for edge in self.edges.values():
@@ -227,16 +240,16 @@ class AttributionGraph:
             if abs(influence[dedup_node_indices[edge.target.id], dedup_node_indices[edge.source.id]]) < self.config.edge_threshold:
                 continue
             export_edges.append(edge)
+        self.exported_edges = export_edges
 
+        print("Exporting graph")
         tokens = [self.model.decode_token(i) for i in self.input_ids]
-        name = "test-1"
         # prefix = ["<EOT>"]
         prefix = []
-        scan = "default"
         metadata = dict(
-            slug=name,
+            slug=self.config.name,
             # scan="jackl-circuits-runs-1-4-sofa-v3_0",
-            scan=scan,
+            scan=self.config.scan,
             prompt_tokens=prefix + tokens,
             prompt="".join(tokens),
             title_prefix="",
@@ -292,8 +305,74 @@ class AttributionGraph:
             )
         )
 
-        open(save_dir / "graph_data" / f"{name}.json", "w").write(json.dumps(result))
+        open(save_dir / "graph_data" / f"{self.config.name}.json", "w").write(json.dumps(result))
         open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=[metadata])))
+
+    async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
+        module_latents = defaultdict(list)
+        for node in self.exported_nodes:
+            if node.node_type == "IntermediateNode":
+                layer, feature = int(node.layer_index), int(node.feature_index)
+                module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
+        module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
+
+        ds = LatentDataset(
+            cache_path,
+            SamplerConfig(), ConstructorConfig(),
+            modules=natsorted(module_latents.keys()),
+            latents=module_latents,
+        )
+
+        logit_weight = self.model.logit_weight
+
+        bar = tqdm(total=sum(map(len, module_latents.values())))
+        def process_feature(feature):
+            layer_idx = int(feature.latent.module_name.split(".")[-2])
+            feature_idx = feature.latent.latent_index
+            index = cantor(layer_idx, feature_idx)
+
+            feature_dir = save_dir / "features" / self.config.scan
+            feature_dir.mkdir(parents=True, exist_ok=True)
+            feature_path = feature_dir / f"{index}.json"
+
+            if feature_path.exists():
+                examples_quantiles = json.loads(feature_path.read_text())["examples_quantiles"]
+            else:
+                examples_quantiles = defaultdict(list)
+                for example in feature.train:
+                    examples_quantiles[example.quantile].append(dict(
+                        is_repeated_datapoint=False,
+                        train_token_index=len(example.tokens) - 1,
+                        tokens=[self.model.decode_token(i) for i in example.tokens.tolist()],
+                        tokens_acts_list=example.activations.tolist(),
+                    ))
+                examples_quantiles = [
+                    dict(
+                        quantile_name=f"Quantile {i}",
+                        examples=examples_quantiles[i],
+                    ) for i in sorted(examples_quantiles.keys())
+                ]
+            with torch.no_grad(), torch.autocast("cuda"):
+                dec_weight = self.model.w_dec(layer_idx)[feature_idx]
+                logits = logit_weight @ dec_weight
+                top_logits = logits.topk(10).indices.tolist()
+                bottom_logits = logits.topk(10, largest=False).indices.tolist()
+            top_logits = [self.model.decode_token(i) for i in top_logits]
+            bottom_logits = [self.model.decode_token(i) for i in bottom_logits]
+
+            feature_vis = dict(
+                index=index,
+                examples_quantiles=examples_quantiles,
+                bottom_logits=bottom_logits,
+                top_logits=top_logits,
+            )
+            feature_path.write_text(json.dumps(feature_vis))
+            bar.update(1)
+            bar.refresh()
+
+        async for feature in ds:
+            process_feature(feature)
+        bar.close()
 
 
     def initialize_graph(self):
