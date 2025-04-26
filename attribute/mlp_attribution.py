@@ -1,84 +1,21 @@
 from dataclasses import dataclass, replace
 import torch
-from typing import Optional
-from functools import lru_cache
 from torch import Tensor
-from transformers import AutoTokenizer
 from tqdm import tqdm
-import random
-import json
 import numpy as np
-import time
-from contextlib import contextmanager
-
-
-
-infcache = lru_cache(maxsize=None)
-
-
-@contextmanager
-def measure_time(name: str, disabled: bool = False):
-    start_time = time.time()
-    yield
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    if not disabled or True:
-        print(f"{name}: {elapsed_time:.4f} seconds")
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-@dataclass
-class Node:
-    id: str
-    layer_index: int
-    token_position: int
-
-    @property
-    def id_js(self):
-        return self.id
-
-    def to_dict(self):
-        """Returns a dictionary representation of the node that can be serialized to JSON.
-
-        Args:
-            exclude_attrs: List of attribute names to exclude from the representation
-        """
-        exclude_attrs = ["output_vector", "input_vector", "list_contributions"]
-        repr_dict = {}
-        for key, value in self.__dict__.items():
-            if key in exclude_attrs:
-                continue
-
-            if isinstance(value, torch.Tensor):
-                temp = value.detach().cpu().to(dtype=torch.float32).numpy().tolist()
-                if isinstance(temp, list):
-                    repr_dict[key] = [
-                        round(x, 4) if isinstance(x, float) else x for x in temp
-                    ]
-                else:
-                    repr_dict[key] = round(temp, 4)
-            else:
-                repr_dict[key] = value
-
-        repr_dict["node_type"] = self.node_type
-        return repr_dict
-
-    @property
-    def node_type(self):
-        return self.__class__.__name__
+from .nodes import (
+    OutputNode,
+    InputNode,
+    IntermediateNode,
+    ErrorNode,
+    Node,
+    Contribution,
+    Edge
+)
+from .caching import TranscodedModel, TranscodedOutputs
+from typing import Optional
+import random
+from .utils import measure_time, infcache
 
 
 @dataclass
@@ -165,108 +102,6 @@ class NodeQueue:
                     self.add(source)
 
 
-
-@dataclass
-class Contribution:
-    source: Node
-    target: Node
-    contribution: float
-    vector: Optional[Tensor] = None
-
-    def to_dict(self):
-        return {
-            "source": self.source.to_dict(),
-            "target": self.target.to_dict(),
-            "contribution": self.contribution,
-        }
-
-
-@dataclass
-class Path:
-    contributions: list[Contribution]
-
-    @property
-    def total_contribution(self):
-        return sum([contribution.contribution for contribution in self.contributions])
-
-    @property
-    def id(self):
-        return "->".join(
-            [contribution.source.id for contribution in self.contributions]
-        )
-
-    def to_dict(self):
-        return {
-            "contributions": [
-                contribution.to_dict() for contribution in self.contributions
-            ],
-            "total_contribution": self.total_contribution,
-        }
-
-
-@dataclass
-class AttentionContribution(Contribution):
-    head: int = 0
-
-
-@dataclass
-class OutputNode(Node):
-    token_str: str
-    probability: float
-    logit: float
-    input_vector: Tensor
-
-
-@dataclass
-class InputNode(Node):
-    token_str: str
-    output_vector: Tensor
-
-
-@dataclass
-class IntermediateNode(Node):
-    feature_index: int
-    activation: Tensor
-    input_vector: Tensor
-    output_vector: Tensor
-
-
-@dataclass
-class AttentionNode(Node):
-    head: int
-    source_token_position: int
-    input_vector: Tensor
-    output_vector: Tensor
-
-
-@dataclass
-class SkipNode(Node):
-    output_vector: Tensor
-
-
-@dataclass
-class ErrorNode(Node):
-    output_vector: Tensor
-
-
-@dataclass
-class Edge:
-    @property
-    def id(self):
-        return f"{self.source.id} -> {self.target.id}"
-
-    source: Node
-    target: Node
-    weight: float
-
-    def to_dict(self):
-        return {
-            "source": self.source.to_dict(),
-            "target": self.target.to_dict(),
-            "weight": round(self.weight, 4),
-        }
-
-
 @dataclass
 class AttributionConfig:
     pre_filter_threshold: float = 1e-2
@@ -277,91 +112,59 @@ class AttributionGraph:
 
     def __init__(
         self,
-        model: torch.nn.Module,
-        tokenizer: AutoTokenizer,
-        transcoders: list[torch.nn.Module],
-        input_ids: Tensor,
-        attention_patterns: list,
-        first_ln: dict,
-        pre_first_ln: dict,
-        second_ln: dict,
-        pre_second_ln: dict,
-        input_norm: dict,
-        output_norm: dict,
-        attn_values: dict,
-        transcoder_activations: dict,
-        errors: dict,
-        skip_connections: dict,
-        logits: Tensor,
-        last_layer_activations: Tensor,
-        W_skip: list[Tensor],
+        model: TranscodedModel,
+        cache: TranscodedOutputs,
         config: AttributionConfig = AttributionConfig()
     ):
         self.config = config
         self.model = model
-        self.tokenizer = tokenizer
-        self.transcoders = transcoders
-        self.input_norm = input_norm
-        self.output_norm = output_norm
-        self.input_ids = input_ids
-        self.attention_patterns = attention_patterns
-        self.first_ln = first_ln
-        self.pre_first_ln = pre_first_ln
-        self.second_ln = second_ln
-        self.pre_second_ln = pre_second_ln
-        self.attn_values = attn_values
-        self.transcoder_activations = transcoder_activations
-        self.errors = errors
-        self.skip_connections = skip_connections
-        self.logits = logits
-        self.W_skip = [ws.detach().to(torch.bfloat16) for ws in W_skip]
-        self.last_layer_activations = last_layer_activations
+        self.cache = cache
         self.nodes: dict[str, Node] = {}
         self.edges: dict[str, Edge] = {}
-        self.paths: list[Path] = []
-        # I want to have a 2D array, where the first dimension is the layer,
-        # the second is the token position and then each of these can have a list of nodes
         self.nodes_by_layer_and_token: dict[int, dict[int, list[Node]]] = {}
+        self.initialize_graph()
+
+    @property
+    def tokenizer(self):
+        return self.model.tokenizer
+
+    @property
+    def num_layers(self):
+        return self.model.num_layers
+
+    @property
+    def seq_len(self):
+        return self.cache.seq_len
+
+    @property
+    def input_ids(self):
+        return self.cache.input_ids[0]
+
+    @property
+    def logits(self):
+        return self.cache.logits[0]
 
     def save_graph(self):
-        # node_edges = {}
-        # for path in self.paths:
-        #     for contribution in path.contributions:
-        #         if contribution.source.id == contribution.target.id:
-        #             continue
-        #         edge_id = f"{contribution.source.id} -> {contribution.target.id}"
-        #         if edge_id not in node_edges:
-        #             node_edges[edge_id] = 0
-        #         node_edges[edge_id] += contribution.contribution
-        # for edge, weight in node_edges.items():
-        #     source,target = edge.split(" -> ")
-        #     edge_id = f"{source} -> {target}"
-        #     edge = Edge(id=edge_id, source=self.nodes[source], target=self.nodes[target], weight=weight)
-        #     self.edges[edge_id] = edge
-
-        dict_repr = {
-            "nodes": [node.to_dict() for node in self.nodes.values()],
-            "edges": [edge.to_dict() for edge in self.edges.values()],
-            # "paths": [path.to_dict() for path in self.paths]
-        }
-        with open("attribution_graph.json", "w") as f:
-            json.dump(dict_repr, f)
+        # TODO
+        pass
 
     def initialize_graph(self):
-        num_layers = len(self.transcoders)
-        seq_len = self.input_ids.shape[0]
+        num_layers = self.num_layers
+        assert self.cache.batch_size == 1, "Batch size >1 not supported"
+        input_ids = self.input_ids
+        seq_len = self.seq_len
         self.nodes_by_layer_and_token = {
             layer: {token: [] for token in range(seq_len)}
             for layer in range(num_layers)
         }
 
         # Start by creating the input nodes
-        for i in range(0, self.input_ids.shape[0]):
-            embedding = self.model.model.embed_tokens.weight[self.input_ids[i]]
+        for i in range(0, seq_len):
+            embedding = self.model.embedding_weight[input_ids[i]]
             input_node = InputNode(
                 id=f"input_{i}",
                 token_position=i,
-                token_str=self.tokenizer.decode([self.input_ids[i]]),
+                token_str=self.tokenizer.decode([input_ids[i]]),
                 output_vector=embedding.to(dtype=torch.bfloat16),
                 layer_index=-1,
             )
@@ -370,57 +173,52 @@ class AttributionGraph:
 
         self.activation_indices_tensors = {}
         # Create the intermediate nodes
-        for key in self.transcoder_activations:
-            activations_tensor, indices_tensor = self.transcoder_activations[key]
-            # TODO: this assumes that the keys are model.layers.i
-            layer_index = int(key.split(".")[2])
-            hookpoint = key
+        for layer, activations in self.cache.mlp_outputs.items():
+            activations_tensor, indices_tensor = (
+                activations.activation[0],
+                activations.location[0],
+            )
 
-            self.activation_indices_tensors[layer_index] = dict(
-                hookpoint=hookpoint,
+            self.activation_indices_tensors[layer] = dict(
                 activations=activations_tensor,
                 indices=indices_tensor,
             )
 
             for token_position, (top_acts, top_indices) in enumerate(
-                zip(activations_tensor, indices_tensor)
+                zip(activations_tensor.tolist(), indices_tensor.tolist())
             ):
-
                 for act, index in zip(top_acts, top_indices):
-
-                    decoder_direction = self.transcoders[hookpoint].W_dec[index, :]
-                    encoder_direction = self.transcoders[hookpoint].encoder.weight[
-                        index, :
-                    ]
+                    decoder_direction = self.model.w_dec(layer)[index]
+                    encoder_direction = self.model.w_enc(layer)[index]
                     intermediate_node = IntermediateNode(
-                        id=f"intermediate_{token_position}_{layer_index}_{index}",
-                        layer_index=layer_index,
-                        feature_index=int(index),
+                        id=f"intermediate_{token_position}_{layer}_{index}",
+                        layer_index=layer,
+                        feature_index=index,
                         token_position=token_position,
                         activation=float(act),
                         input_vector=encoder_direction.to(dtype=torch.bfloat16),
                         output_vector=decoder_direction.to(dtype=torch.bfloat16),
                     )
                     self.nodes[intermediate_node.id] = intermediate_node
-                    self.nodes_by_layer_and_token[layer_index][token_position].append(
+                    self.nodes_by_layer_and_token[layer][token_position].append(
                         intermediate_node
                     )
                 # Create the error and skip nodes
-                error = self.errors[key][token_position]
+                error = activations.error[0, token_position]
                 error_node = ErrorNode(
-                    id=f"error_{token_position}_{layer_index}",
-                    layer_index=layer_index,
+                    id=f"error_{token_position}_{layer}",
+                    layer_index=layer,
                     token_position=token_position,
                     output_vector=error.to(dtype=torch.bfloat16),
                 )
-                self.nodes_by_layer_and_token[layer_index][token_position].append(
+                self.nodes_by_layer_and_token[layer][token_position].append(
                     error_node
                 )
                 self.nodes[error_node.id] = error_node
         # Create the output node
         # Top 10 logits
         with torch.no_grad():
-            probabilities = torch.nn.functional.softmax(self.logits[0, -1, :], dim=0)
+            probabilities = torch.nn.functional.softmax(self.logits[-1, :], dim=0)
         top_10_indices = torch.argsort(probabilities, descending=True)[:10]
         top_10_probabilities = probabilities[top_10_indices]
         total_probability = 0
@@ -429,12 +227,12 @@ class AttributionGraph:
             # "logit_i - mean logit"; what does "mean logit" mean?
             # i assume it is the mean according to the softmax distribution
             # because that is the gradient of softmax ignoring the scaling factor
-            before_gradient = self.logits[0, -1, top_10_indices[i]] - \
-                torch.dot(self.logits[0, -1, :], self.logits[0, -1, :].softmax(dim=-1).detach())
+            before_gradient = self.logits[-1, top_10_indices[i]] - \
+                torch.dot(self.logits[-1, :], self.logits[-1, :].softmax(dim=-1).detach())
             before_gradient.backward(retain_graph=True)
-            gradient = self.last_layer_activations.grad
+            gradient = self.cache.last_layer_activations.grad
             assert gradient is not None
-            self.last_layer_activations.grad = None
+            self.cache.last_layer_activations.grad = None
             # gradient = self.logits[0,-1,top_10_indices[i]].expand(gradient.shape)
             # vector = self.model.lm_head.weight[top_10_indices[i]]#-torch.mean(self.model.lm_head.weight,dim=0)
             output_node = OutputNode(
@@ -442,9 +240,9 @@ class AttributionGraph:
                 token_position=seq_len - 1,
                 token_str=self.tokenizer.decode([top_10_indices[i]]),
                 probability=top_10_probabilities[i].item(),
-                logit=self.logits[0, -1, top_10_indices[i]].item(),
+                logit=self.logits[-1, top_10_indices[i]].item(),
                 input_vector=gradient[0, -1].to(dtype=torch.bfloat16),
-                layer_index=len(self.transcoders),
+                layer_index=self.num_layers,
             )
             self.nodes[output_node.id] = output_node
             output_nodes.append(output_node)
@@ -468,23 +266,9 @@ class AttributionGraph:
             contribution=attribution,
         )
 
-    # def mlp_contribution(self, last_contribution:Contribution, layer_index:int) -> list[Contribution]:
-
-    #     contribution_direction = last_contribution.vector
-
-    #     # the previous source is the new target
-    #     token_position = last_contribution.source.token_position
-    #     target_node = last_contribution.source
     def mlp_contribution(
         self, contribution_vector: torch.Tensor, layer_index: int
     ) -> list[Contribution]:
-
-        #     contribution_direction = last_contribution.vector
-
-        #     # the previous source is the new target
-        #     token_position = last_contribution.source.token_position
-        #     target_node = last_contribution.source
-        # get all the nodes that are in the same token position and layer
         contributions = []
 
         for token_position in range(contribution_vector.shape[-2]):
@@ -497,8 +281,6 @@ class AttributionGraph:
             nodes = [
                 node
                 for node in nodes
-                # if not isinstance(node, AttentionNode)
-                # and not isinstance(node, InputNode)
                 if isinstance(node, ErrorNode)
             ]
             # get the contribution of each node
@@ -518,8 +300,7 @@ class AttributionGraph:
         contribution = contribution_vector
         while contribution.ndim > 2:
             contribution = contribution[0]
-        hookpoint = acts["hookpoint"]
-        w_dec = self.transcoders[hookpoint].W_dec
+        w_dec = self.model.w_dec(layer_index)
         similarities = torch.einsum(
             "...fd,...d->...f",
             w_dec[indices]
@@ -530,26 +311,18 @@ class AttributionGraph:
         sims = similarities[time_idx, feature_idx].tolist()
         indexes = indices[time_idx, feature_idx]
         for t, f, s, i in zip(time_idx, feature_idx, sims, indexes):
-            # source = self.nodes_by_layer_and_token[layer_index][t][f]
             source = self.nodes[f"intermediate_{t}_{layer_index}_{i}"]
 
-            # if abs(s) > 2 and contribution.norm(dim=-1).abs().max() < 2:
-            #     print(contribution.norm(dim=-1))
-            #     print(self.compute_mlp_node_contribution(source, None, contribution[t]).contribution, s)
             contributions.append(Contribution(
                 source=source,
                 target=None,
                 contribution=s / source.activation
             ))
+
         return [
             replace(contribution, contribution=float(contribution.contribution))
             for contribution in contributions
         ]
-        # return [
-        #     replace(contribution, contribution=float(contribution.contribution))
-        #     for contribution in contributions
-        #     if abs(contribution.contribution) >= 1e-4
-        # ]
 
     def backward(
         self,
@@ -558,150 +331,28 @@ class AttributionGraph:
         layer_index: int,
     ):
         # batch size, n_heads, seq_len, seq_len
-        attention_pattern = self.attention_patterns[layer_index]
-        # d_model d_model
-        wO = self.model.model.layers[layer_index].self_attn.o_proj.weight.to(
+        attention_pattern = self.cache.attn_outputs[layer_index].attn_patterns
+        # d_model n_heads d_head
+        wO = self.model.attn_output(layer_index).to(
             attention_pattern.device
         )
-        # reshape to be n_heads d_head d_model
-        wO = wO.reshape(attention_pattern.shape[1], -1, wO.shape[1])
         # batch size, n_heads, seq_len, d_head
-        attn_post_value_gradient = torch.einsum("b s d, h v d -> b h s v", vector, wO)
+        attn_post_value_gradient = torch.einsum("b s d, d h v -> b h s v", vector, wO)
         # batch size, n_heads, seq_len, d_head
         attn_pre_value_gradient = torch.einsum(
             "b h y v, b h y x -> b h x v", attn_post_value_gradient, attention_pattern
         )
 
-        wV = self.model.model.layers[layer_index].self_attn.v_proj.weight.to(
+        wV = self.model.attn_value(layer_index).to(
             attention_pattern.device
         )
-        # TODO repeat for GQA
-        wV = torch.repeat_interleave(wV, wO.shape[0] * wO.shape[1] // wV.shape[0], dim=0)
-        # reshape to be n_heads d_model d_head
-        wV = wV.reshape(attention_pattern.shape[1], attn_pre_value_gradient.shape[-1], wV.shape[1])
         # batch size, seq_len, d_model
         attn_pre_proj_gradient = torch.einsum(
             "b h s v, h v d -> b s d", attn_pre_value_gradient, wV
         )
-
-        # attn_pre_proj_gradient = attn_pre_proj_gradient * self.layer_norm_constant(
-        #     attn_pre_proj_gradient,
-        #     layer_index,
-        #     0,
-        #     is_ln2=False
-        # )
-
-        ln = self.first_ln[f"model.layers.{layer_index}"]
-        pre_ln = self.pre_first_ln[f"model.layers.{layer_index}"]
-        attn_pre_proj_gradient = attn_pre_proj_gradient * torch.nan_to_num(ln / pre_ln)
+        attn_pre_proj_gradient = attn_pre_proj_gradient * self.cache.attn_outputs[layer_index].ln_factor
 
         return attn_pre_proj_gradient + vector
-
-        # batch head dst src, batch head src d_head -> batch head dst src d_head
-        # # this is different from TransformerLens order
-        # values_weighted_by_pattern = torch.einsum(
-        #     'b h d s, b h s f -> b h d s f',
-        #     attention_pattern, attn_values
-        # )
-
-        # #batch head dst src d_head, head d_head d_model -> batch head dst src d_model
-        # weighted_by_wO = torch.einsum(
-        #     'b h d s f, h f m -> b h d s m',
-        #     values_weighted_by_pattern, wO
-        # )
-        # weighted_attention_head_contribution.append(weighted_by_wO)
-        # wV = self.model.model.layers[layer_index].self_attn.v_proj.weight.to(attention_pattern.device)
-        # # TODO: this is 3 for smoLLM but we should get the correct number of key value heads
-        # wV = torch.repeat_interleave(wV,3,dim=0)
-        # # reshape to be n_heads d_model d_head
-        # wV = wV.reshape(attn_values.shape[1],wV.shape[1],-1)
-
-        # #head d_head d_model, head d_model d_head -> head d_model d_model
-        # OV = torch.einsum(
-        #     'h f m, h n f -> h n m',
-        #     wO, wV
-        # )
-        # OVs.append(OV)
-
-    def compute_node_head_contribution(
-        self, node: Node, target_node: Node, vector: Tensor
-    ) -> Contribution:
-        assert isinstance(node, AttentionNode)
-        head = node.head
-        token_position = node.token_position
-        layer_index = node.layer_index
-
-        # how much is the node contributing to the upstream node
-
-        dot_product = torch.dot(vector, node.output_vector)
-        attribution = dot_product
-
-        # attention feature vector
-        contribution_vector = node.input_vector @ vector
-        ln_constant = self.layer_norm_constant(
-            contribution_vector, layer_index, token_position, is_ln2=False
-        )
-        contribution_vector = contribution_vector * ln_constant
-        new_contribution = AttentionContribution(
-            source=node,
-            target=target_node,
-            contribution=attribution.item(),
-            vector=contribution_vector,
-            head=head,
-        )
-
-        return new_contribution
-
-    def attention_contribution(
-        self, last_contribution: Contribution, layer_index: int
-    ) -> list[Contribution]:
-
-        contribution_direction = last_contribution.vector
-
-        # the previous source is the new target
-        token_position = last_contribution.source.token_position
-        target_node = last_contribution.source
-
-        # get all the nodes that are in the same layer position and any token position
-        # before the target node
-        nodes_dict = self.nodes_by_layer_and_token[layer_index]
-        nodes = []
-        # need to include the target node token position
-        for tok in range(token_position + 1):
-            all_nodes = nodes_dict[tok]
-            attention_nodes = [
-                node for node in all_nodes if isinstance(node, AttentionNode)
-            ]
-            nodes.extend(attention_nodes)
-
-        contributions = []
-
-        weighted_attention_head_contribution = (
-            self.weighted_attention_head_contribution[layer_index]
-        )
-        contrib = (
-            weighted_attention_head_contribution[0, :, token_position, :]
-            @ contribution_direction
-        )
-        # get the top 10 contributions,
-        # TODO: we can potentially remove this part
-        _, top_attn_contrib_indices_flattened = torch.topk(
-            contrib.flatten(), k=min([50, len(contrib)])
-        )
-        top_attn_contrib_indices = np.array(
-            np.unravel_index(
-                top_attn_contrib_indices_flattened.cpu().numpy(), contrib.shape
-            )
-        ).T.tolist()
-        for node in tqdm(nodes, desc="Computing Node contributions", disable=True):
-            node_head = node.head
-            node_token_position = node.token_position
-            if [node_head, node_token_position] in top_attn_contrib_indices:
-                new_contribution = self.compute_node_head_contribution(
-                    node, target_node, contribution_direction
-                )
-                contributions.append(new_contribution)
-        return contributions
 
     @torch.no_grad()
     @torch.autocast("cuda")
@@ -732,17 +383,15 @@ class AttributionGraph:
             gradient = target_node.input_vector
             if gradient.ndim == 1:
                 gradient = gradient.unsqueeze(0)
-                gradient = gradient.repeat(self.input_ids.shape[-1], 1)
+                gradient = gradient.repeat(self.seq_len, 1)
                 gradient = (
                     gradient
                     * (
-                        torch.arange(0, self.input_ids.shape[-1], device=gradient.device)
+                        torch.arange(0, self.seq_len, device=gradient.device)
                         == target_node.token_position
                     )[:, None]
                 )
-            ln = self.second_ln[f"model.layers.{max_layer}.post_attention_layernorm"]
-            pre_ln = self.pre_second_ln[f"model.layers.{max_layer}.post_attention_layernorm"]
-            gradient = gradient * torch.nan_to_num(ln / pre_ln)
+            gradient = gradient * self.cache.mlp_outputs[max_layer].ln_factor
         all_mlp_contributions = []
         with measure_time(
             f"Computing MLP contributions of node {target_node.id}",
@@ -756,15 +405,11 @@ class AttributionGraph:
                 if layer != max_layer:
                     contributions = self.mlp_contribution(gradient, layer)
                     all_mlp_contributions.extend(contributions)
-                    skipped = gradient @ self.W_skip[layer]
-                    ln = self.second_ln[f"model.layers.{layer}.post_attention_layernorm"]
-                    pre_ln = self.pre_second_ln[
-                        f"model.layers.{layer}.post_attention_layernorm"
-                    ]
-                    skipped = skipped * torch.nan_to_num(ln / pre_ln)
+
+                    skipped = gradient @ self.model.w_skip(layer)
+                    skipped = skipped * self.cache.mlp_outputs[layer].ln_factor
                     gradient = gradient + skipped
                 gradient = self.backward(gradient, layer)
-                # # print(layer, gradient.norm(dim=-1).mean())
 
         with measure_time(
             f"Computing embedding contributions of node {target_node.id}",
@@ -808,11 +453,10 @@ class AttributionGraph:
                         weight=weight,
                     )
                     self.edges[edge.id] = edge
-                    # if path ends with input node, error node or skip node, it is finished and we don't want to add it to the queue
+                    # if path ends with input node or error node, it is finished and we don't want to add it to the queue
                     if (
                         isinstance(new_source, InputNode)
                         or isinstance(new_source, ErrorNode)
-                        or isinstance(new_source, SkipNode)
                     ):
                         continue
                     new_sources.append(
@@ -824,19 +468,6 @@ class AttributionGraph:
                     )
 
             queue.add_many(new_sources, self.config.top_k_edges)
-
-        # sometimes sort by total contribution
-        # if random.random() < 0.1:
-        #     new_paths.sort(key=lambda x: x.total_contribution, reverse=True)
-        # else:
-        #     # the other times sort by the past contribution
-        #     new_paths.sort(key=lambda x: abs(x.contributions[-1].contribution), reverse=True)
-
-        # queue.extend(new_sources)
-        # queue.sort(key=lambda x: abs(x.contribution), reverse=True)
-
-        # sort the queue with the total contribution of each path
-        return queue
 
     def flow(self, num_iterations: int = 100000):
         queue = NodeQueue()
@@ -851,7 +482,3 @@ class AttributionGraph:
             if not queue:
                 print("Queue is empty")
                 break
-            # every 10 iterations, save the graph
-            # if i % 10 == 0:
-                # self.save_graph()
-        # self.save_graph()

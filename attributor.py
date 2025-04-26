@@ -1,4 +1,6 @@
 #%%
+%load_ext autoreload
+%autoreload 2
 %env CUDA_VISIBLE_DEVICES=1
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -9,226 +11,38 @@ from attribute.mlp_attribution import AttributionGraph
 
 import fire
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`, *optional*):
-            Deprecated and unused.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def rotary_llama(x,position_ids,inv_freq,attention_scaling):
-    inv_freq_expanded = inv_freq[None, :, None].float().expand(1, -1, 1).to(x.device)
-    position_ids_expanded = position_ids[:, None, :].float()
-
-    with torch.autocast(device_type="cuda", enabled=False):  # Force float32
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos() * attention_scaling
-        sin = emb.sin() * attention_scaling
-
-    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-model_name = "HuggingFaceTB/SmolLM2-135M"
-dataset = "EleutherAI/fineweb-edu-dedup-10b"
-split = "train"
-# prompt = "When John and Mary went to the store, John gave a bag to"
-prompt = "Fact: Michael Jordan plays the sport of"
-# prompt = "3 + 5 ="
-# prompt = "The National Digital Analytics Group (N"
-
-
-
-model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map={"": "cuda:0"},
-        torch_dtype=torch.bfloat16,
-
-    )
-
-# dataset = load_dataset(
-#                 dataset,
-#                 split=split)
-
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-#model = LanguageModel(model_name)
-# dataset = chunk_and_tokenize(
-#     dataset,
-#     tokenizer,
-#     max_seq_len=2048,
-#     num_proc=cpu_count() // 2,
-#     text_key="text",
-# )
-
-# data = dataset.select(range(0,1000))
-# dl = DataLoader(
-#     data,  # type: ignore
-#     batch_size=2, # Reduced batch size for potentially higher memory usage with hooks
-#     shuffle=False,
-# )
-
-transcoders = {}
-hookpoints_mlp = [f"model.layers.{i}.mlp" for i in range(model.config.num_hidden_layers)] # Use model config for layer count
-for hookpoint in hookpoints_mlp:
-    temp_hookpoint = hookpoint.replace("model.layers.", "layers.")
-    sae = SparseCoder.load_from_disk(
-                f"/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x/{temp_hookpoint}",
-                device="cuda",
-            )
-    transcoders[hookpoint] = sae
-#prompt = "Cow Cow Fish Fish Cat"
-
-attn_values = {}
-first_ln = {}
-pre_first_ln = {}
-second_ln = {}
-pre_second_ln = {}
-def get_attention_values_hook(module, input, output):
-    # this hook is in the layer
-    residual = input[0]
-    pre_first_ln[module_to_name[module]] = residual
-    layer_normed = module.input_layernorm(residual)
-    first_ln[module_to_name[module]] = layer_normed
-
-    # stuff related to attention
-    input_shape = layer_normed.shape[:-1]
-    hidden_shape = (*input_shape, -1, module.self_attn.head_dim)
-
-    value_states = module.self_attn.v_proj(layer_normed).view(hidden_shape).transpose(1, 2)
-    values = repeat_kv(value_states, 3)
-    attn_values[module_to_name[module]] = values
-
-def get_ln2_hook(module, input, output):
-    pre_second_ln[module_to_name[module]] = input[0]
-    second_ln[module_to_name[module]] = output
-
-transcoder_activations = {}
-errors = {}
-skip_connections = {}
-input_norm = {}
-output_norm = {}
-def get_mlp_hook(module, input, output):
-
-    if isinstance(input, tuple):
-        input = input[0]
-
-    module_name = module_to_name[module]
-    transcoder = transcoders[module_name]
-    # have to reshape input to lose the batch dimension
-    input = input.view(-1, input.shape[-1])
-    # have to normalize input
-    input_norm[module_name] = input.norm(dim=1, keepdim=True)
-    # input = input / input_norm[module_name]
-    transcoder_acts = transcoder(input)
-    # have to reshape output to get the batch dimension back
-    transcoder_out = transcoder_acts.sae_out.view(output.shape)
-    # have to unnormalize output
-    transcoder_out_constant = output.norm(dim=2, keepdim=True)[0]
-    output_norm[module_name] = transcoder_out_constant
-    transcoder_out_constant = torch.ones_like(transcoder_out_constant)
-    # error = output - transcoder_out * output_norm[module_name]
-    error = output - transcoder_out
-
-    skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
-    # activations = transcoder_acts.latent_acts * transcoder_out_constant
-    activations = transcoder_acts.latent_acts
-    transcoder_activations[module_name] = (
-        activations,
-        transcoder_acts.latent_indices,
-    )
-
-    # skip_connections[module_name] = skip[0] * transcoder_out_constant
-    skip_connections[module_name] = skip[0]
-    errors[module_name] = error[0]
-# last_layer_activations = []
-# def get_last_layer_hook(module, input, output):
-
-#     last_layer_activations.append(output[0])
-
-hookpoints_layer = [f"model.layers.{i}" for i in range(model.config.num_hidden_layers)]
-hookpoints_ln = [f"model.layers.{i}.post_attention_layernorm" for i in range(model.config.num_hidden_layers)]
-name_to_module = {
-            name: model.get_submodule(name) for name in hookpoints_layer + hookpoints_mlp + hookpoints_ln
-}
-module_to_name = {v: k for k, v in name_to_module.items()}
-for name, module in name_to_module.items():
-    if ".mlp" in name:
-        handle = module.register_forward_hook(get_mlp_hook)
-    elif ".post_attention_layernorm" in name:
-        handle = module.register_forward_hook(get_ln2_hook)
-    else:
-        handle = module.register_forward_hook(get_attention_values_hook)
-
-
-tokenized_prompt = tokenizer(prompt, return_tensors="pt").to("cuda:0")
-outputs = model(**tokenized_prompt,output_attentions=True,output_hidden_states=True)
-attention_patterns = outputs.attentions
-logits = outputs.logits
-last_layer_activations = outputs.hidden_states[-1]
-last_layer_activations.retain_grad()
+from delphi.latents import LatentDataset
+from delphi.config import SamplerConfig, ConstructorConfig
+from natsort import natsorted
+from collections import defaultdict
+from pathlib import Path
+from attribute.nodes import OutputNode
+from attribute.utils import cantor
+from attribute.caching import TranscodedModel
+import json
+from matplotlib import pyplot as plt
+import numpy as np
+from tqdm.auto import tqdm
 #%%
-tokenized_prompt["input_ids"][0]
-
+model_name = "HuggingFaceTB/SmolLM2-135M"
+hookpoint_fn = lambda hookpoint: hookpoint.replace("model.layers.", "layers.")
+transcoder_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x"
+model = TranscodedModel(
+    model_name=model_name,
+    transcoder_path=transcoder_path,
+    hookpoint_fn=hookpoint_fn,
+    device="cuda",
+)
+#%%
+# prompt = "When John and Mary went to the store, John gave a bag to"
+# prompt = "Fact: Michael Jordan plays the sport of"
+# prompt = "3 + 5 ="
+prompt = "The National Digital Analytics Group (N"
+transcoded_outputs = model(prompt)
 #%%
 %load_ext autoreload
 %autoreload 2
-#exit()
-attribution_graph = AttributionGraph(model,
-                    tokenizer,
-                    transcoders,
-                    tokenized_prompt["input_ids"][0],
-                    attention_patterns,
-                    first_ln,pre_first_ln,second_ln,pre_second_ln,
-                    input_norm,
-                    output_norm,
-                    attn_values,
-                    transcoder_activations,
-                    errors,
-                    skip_connections,
-                    logits,
-                    last_layer_activations,
-                    [
-                        transcoders[module].W_skip for module in hookpoints_mlp
-                    ])
-attribution_graph.initialize_graph()
+attribution_graph = AttributionGraph(model, transcoded_outputs)
 %time attribution_graph.flow(2_000)
 #%%
 edges = attribution_graph.edges
@@ -240,8 +54,6 @@ for i, node in enumerate(set(x for pair in edge_keys for x in pair)):
     nodes.append(node)
     indices[node] = i
 # %%
-import numpy as np
-from tqdm.auto import tqdm
 matrix = np.zeros((len(nodes), len(nodes)))
 for i, edge in enumerate(tqdm(edges)):
     source, target = edge_keys[i]
@@ -249,7 +61,6 @@ for i, edge in enumerate(tqdm(edges)):
     matrix[indices[target], indices[source]] = abs(edges[edge].weight)
 matrix /= np.maximum(1e-2, matrix.sum(axis=1, keepdims=True))
 #%%
-from matplotlib import pyplot as plt
 def cg(x, cf=500):
     x = x[:x.shape[0] // cf * cf, :x.shape[1] // cf * cf]
     x = x.reshape(x.shape[0] // cf, cf, x.shape[1] // cf, cf)
@@ -300,8 +111,8 @@ edge_threshold = 1e-3
 # select used node names
 selected_nodes = [node for i, node in enumerate(nodes)
                   if attribution_graph.nodes[node].node_type in ("InputNode", "OutputNode", "ErrorNode")]
-for seq_idx in range(tokenized_prompt["input_ids"].shape[-1]):
-    for layer_idx in range(model.config.num_hidden_layers):
+for seq_idx in range(transcoded_outputs.input_ids.shape[-1]):
+    for layer_idx in range(model.num_layers):
         matching_nodes = [
             node for node in nodes
             if attribution_graph.nodes[node].layer_index == layer_idx
@@ -337,13 +148,10 @@ for eid, e in attribution_graph.edges.items():
 #%%
 len(export_nodes), len(export_edges)
 #%%
-from pathlib import Path
-from attribute.mlp_attribution import OutputNode
-import json
 
 save_dir = Path("../attribution-graphs-frontend")
 
-tokens = [tokenizer.decode([i]) for i in tokenized_prompt["input_ids"][0].tolist()]
+tokens = [model.decode_token(i) for i in transcoded_outputs.input_ids[0].tolist()]
 name = "test-1"
 # prefix = ["<EOT>"]
 prefix = []
@@ -355,7 +163,7 @@ metadata = dict(
     prompt_tokens=prefix + tokens,
     prompt="".join(tokens),
     title_prefix="",
-    n_layers=model.config.num_hidden_layers,
+    n_layers=model.num_layers,
 )
 
 nodes_json = [
@@ -367,7 +175,7 @@ nodes_json = [
             ErrorNode="mlp reconstruction error",
         )[node.node_type],
         layer=(str(node.layer_index)
-        if node.layer_index != model.config.num_hidden_layers else "-1")
+        if node.layer_index != model.num_layers else "-1")
         if node.layer_index != -1 else "E",
         node_id=node.id_js,
         jsNodeId=node.id_js + "-0",
@@ -380,8 +188,6 @@ nodes_json = [
     ) for node in export_nodes
 ]
 
-def cantor(l, f):
-    return (l + f) * (l + f + 1) // 2 + f
 
 for node in nodes_json:
     if node["feature_type"] != "cross layer transcoder":
@@ -389,16 +195,9 @@ for node in nodes_json:
     l, f = int(node["layer"]), int(node["feature"])
     idx_cantor = cantor(l, f)
     node["feature"] = idx_cantor
-    prefix, mid, suffix = node["node_id"].rpartition("_")
-    # node["node_id"] = prefix + mid + str(idx_cantor)
 
 links_json = [
-    dict(
-        source=e.source.id,
-        target=e.target.id,
-        weight=e.weight,
-    )
-    for e in export_edges
+    e.to_dict() for e in export_edges
 ]
 
 result = dict(
@@ -420,22 +219,14 @@ result = dict(
 open(save_dir / "graph_data" / f"{name}.json", "w").write(json.dumps(result))
 open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=[metadata])))
 #%%
-from collections import defaultdict
-# [attribution_graph.nodes[node] for
 module_latents = defaultdict(list)
 for selected_node in selected_nodes:
     node = attribution_graph.nodes[selected_node]
     if node.node_type == "IntermediateNode":
         l, f = int(node.layer_index), int(node.feature_index)
-        print(cantor(l, f))
-        module_latents[hookpoints_layer[l].partition(".")[2] + ".mlp"].append(f)
+        module_latents[model.temp_hookpoints_mlp[l]].append(f)
 module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
-#%%
-module_latents.keys()
 # %%
-from delphi.latents import LatentDataset
-from delphi.config import SamplerConfig, ConstructorConfig
-from natsort import natsorted
 cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents"
 ds = LatentDataset(
     cache_path,
@@ -445,9 +236,8 @@ ds = LatentDataset(
 )
 
 #%%
-logit_weight = model.lm_head.weight * model.model.norm.weight
+logit_weight = model.logit_weight
 # %%
-from tqdm import tqdm
 bar = tqdm(total=sum(map(len, module_latents.values())))
 def process_feature(feature):
     layer_idx = int(feature.latent.module_name.split(".")[-2])
@@ -466,7 +256,7 @@ def process_feature(feature):
             examples_quantiles[example.quantile].append(dict(
                 is_repeated_datapoint=False,
                 train_token_index=len(example.tokens) - 1,
-                tokens=[tokenizer.decode([i]) for i in example.tokens.tolist()],
+                tokens=[model.decode_token(i) for i in example.tokens.tolist()],
                 tokens_acts_list=example.activations.tolist(),
             ))
         examples_quantiles = [
@@ -476,12 +266,12 @@ def process_feature(feature):
             ) for i in sorted(examples_quantiles.keys())
         ]
     with torch.no_grad(), torch.autocast("cuda"):
-        dec_weight = transcoders[hookpoints_mlp[layer_idx]].W_dec[feature_idx]
+        dec_weight = model.w_dec(layer_idx)[feature_idx]
         logits = logit_weight @ dec_weight
         top_logits = logits.topk(10).indices.tolist()
         bottom_logits = logits.topk(10, largest=False).indices.tolist()
-    top_logits = [tokenizer.decode([i]) for i in top_logits]
-    bottom_logits = [tokenizer.decode([i]) for i in bottom_logits]
+    top_logits = [model.decode_token(i) for i in top_logits]
+    bottom_logits = [model.decode_token(i) for i in bottom_logits]
 
     feature_vis = dict(
         index=index,
