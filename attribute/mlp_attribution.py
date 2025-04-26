@@ -426,9 +426,11 @@ class AttributionGraph:
         total_probability = 0
         output_nodes = []
         for i in range(10):
-            before_gradient = self.logits[0, -1, top_10_indices[i]] - torch.mean(
-                self.logits[0, -1, :]
-            )
+            # "logit_i - mean logit"; what does "mean logit" mean?
+            # i assume it is the mean according to the softmax distribution
+            # because that is the gradient of softmax ignoring the scaling factor
+            before_gradient = self.logits[0, -1, top_10_indices[i]] - \
+                torch.dot(self.logits[0, -1, :], self.logits[0, -1, :].softmax(dim=-1).detach())
             before_gradient.backward(retain_graph=True)
             gradient = self.last_layer_activations.grad
             assert gradient is not None
@@ -450,77 +452,6 @@ class AttributionGraph:
             if total_probability > 0.95:
                 break
         self.output_nodes = output_nodes
-
-    def compute_weighted_attention_head_contribution(self):
-        weighted_attention_head_contribution = []
-        # We can store attention contribution instead of all the patterns and values
-        OVs = []
-        # inspired by get_attn_head_contribs in transcoder_circuits/transcoder_circuits/circuit_analysis.py
-        for layer_index in range(len(self.attention_patterns)):
-            # batch size, n_heads, seq_len, seq_len
-            attention_pattern = self.attention_patterns[layer_index]
-            # batch size, n_heads, seq_len, d_head
-            attn_values = self.attn_values[f"model.layers.{layer_index}"].to(
-                attention_pattern.device
-            )
-            # batch size, d_model d_model
-            wO = self.model.model.layers[layer_index].self_attn.o_proj.weight.to(
-                attention_pattern.device
-            )
-            # reshape to be n_heads d_head d_model
-            wO = wO.reshape(attn_values.shape[1], -1, wO.shape[1])
-            # batch head dst src, batch head src d_head -> batch head dst src d_head
-            # this is different from TransformerLens order
-            values_weighted_by_pattern = torch.einsum(
-                "b h d s, b h s f -> b h d s f", attention_pattern, attn_values
-            )
-
-            # batch head dst src d_head, head d_head d_model -> batch head dst src d_model
-            weighted_by_wO = torch.einsum(
-                "b h d s f, h f m -> b h d s m", values_weighted_by_pattern, wO
-            )
-            weighted_attention_head_contribution.append(weighted_by_wO)
-            wV = self.model.model.layers[layer_index].self_attn.v_proj.weight.to(
-                attention_pattern.device
-            )
-            # TODO: this is 3 for smoLLM but we should get the correct number of key value heads
-            wV = torch.repeat_interleave(wV, 3, dim=0)
-            # reshape to be n_heads d_model d_head
-            wV = wV.reshape(attn_values.shape[1], wV.shape[1], -1)
-
-            # head d_head d_model, head d_model d_head -> head d_model d_model
-            OV = torch.einsum("h f m, h n f -> h n m", wO, wV)
-            OVs.append(OV)
-
-        self.weighted_attention_head_contribution = weighted_attention_head_contribution
-        self.OVs = OVs
-
-    def layer_norm_constant(
-        self,
-        vector: Tensor,
-        layer_index: int,
-        token_position: int,
-        is_ln2: bool = False,
-    ) -> Tensor:
-        if is_ln2:
-            ln = self.second_ln[f"model.layers.{layer_index}.post_attention_layernorm"][
-                0, token_position
-            ]
-            pre_ln = self.pre_second_ln[
-                f"model.layers.{layer_index}.post_attention_layernorm"
-            ][0, token_position]
-        else:
-            ln = self.first_ln[f"model.layers.{layer_index}"][0, token_position]
-            pre_ln = self.pre_first_ln[f"model.layers.{layer_index}"][0, token_position]
-        # like in transformer circuits
-        # if torch.dot(vector, pre_ln) == 0:
-        # return torch.tensor(0.)
-        vector = vector.float()
-        ln = ln.to(vector)
-        pre_ln = pre_ln.to(vector)
-        return torch.nan_to_num(torch.dot(vector, ln) / torch.dot(vector, pre_ln))
-        # return torch.norm(ln)/torch.norm(pre_ln)
-        # TODO: should it be torch.norm(ln)/torch.norm(pre_ln)?
 
     def compute_mlp_node_contribution(
         self,
@@ -644,13 +575,10 @@ class AttributionGraph:
         wV = self.model.model.layers[layer_index].self_attn.v_proj.weight.to(
             attention_pattern.device
         )
-        wQ = self.model.model.layers[layer_index].self_attn.q_proj.weight.to(
-            attention_pattern.device
-        )
         # TODO repeat for GQA
-        wV = torch.repeat_interleave(wV, wQ.shape[0] // wV.shape[0], dim=0)
+        wV = torch.repeat_interleave(wV, wO.shape[0] * wO.shape[1] // wV.shape[0], dim=0)
         # reshape to be n_heads d_model d_head
-        wV = wV.reshape(attention_pattern.shape[1], -1, wV.shape[1])
+        wV = wV.reshape(attention_pattern.shape[1], attn_pre_value_gradient.shape[-1], wV.shape[1])
         # batch size, seq_len, d_model
         attn_pre_proj_gradient = torch.einsum(
             "b h s v, h v d -> b s d", attn_pre_value_gradient, wV

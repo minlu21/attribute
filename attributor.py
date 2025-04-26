@@ -70,7 +70,10 @@ def rotary_llama(x,position_ids,inv_freq,attention_scaling):
 model_name = "HuggingFaceTB/SmolLM2-135M"
 dataset = "EleutherAI/fineweb-edu-dedup-10b"
 split = "train"
-prompt = "When John and Mary went to the store, John gave a bag to"
+# prompt = "When John and Mary went to the store, John gave a bag to"
+prompt = "Fact: Michael Jordan plays the sport of"
+# prompt = "3 + 5 ="
+# prompt = "The National Digital Analytics Group (N"
 
 
 
@@ -163,7 +166,6 @@ def get_mlp_hook(module, input, output):
     transcoder_out_constant = torch.ones_like(transcoder_out_constant)
     # error = output - transcoder_out * output_norm[module_name]
     error = output - transcoder_out
-    print(module_name, output.norm(dim=2).mean(), transcoder_out.norm(dim=2).mean(), error.norm(dim=2).mean())
 
     skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
     # activations = transcoder_acts.latent_acts * transcoder_out_constant
@@ -202,6 +204,8 @@ attention_patterns = outputs.attentions
 logits = outputs.logits
 last_layer_activations = outputs.hidden_states[-1]
 last_layer_activations.retain_grad()
+#%%
+tokenized_prompt["input_ids"][0]
 
 #%%
 %load_ext autoreload
@@ -285,21 +289,47 @@ plt.yscale("log")
 for i in usage.argsort()[-10:]:
     print(nodes[i], usage[i])
 #%%
-node_thresold = 1e-3
+# node_thresold = 1e-3
+# node_thresold = 5e-3
+# node_thresold = 5e-3
+node_thresold = 1e-2
+secondary_threshold = 1e-4
+per_layer_position = 2
 edge_threshold = 1e-3
 #%%
 # select used node names
 selected_nodes = [node for i, node in enumerate(nodes)
-                  if usage[i] > node_thresold
-                  or attribution_graph.nodes[node].node_type in ("InputNode", "OutputNode")
-                  ]
+                  if attribution_graph.nodes[node].node_type in ("InputNode", "OutputNode", "ErrorNode")]
+for seq_idx in range(tokenized_prompt["input_ids"].shape[-1]):
+    for layer_idx in range(model.config.num_hidden_layers):
+        matching_nodes = [
+            node for node in nodes
+            if attribution_graph.nodes[node].layer_index == layer_idx
+            and attribution_graph.nodes[node].token_position == seq_idx
+            and node not in selected_nodes
+        ]
+        matching_nodes.sort(key=lambda x: usage[indices[x]], reverse=True)
+        matching_nodes = matching_nodes[:per_layer_position] + [
+            node
+            for node in matching_nodes[per_layer_position:]
+            if usage[indices[node]] > node_thresold
+        ]
+        matching_nodes = [
+            node for node in matching_nodes
+            if usage[indices[node]] > secondary_threshold
+        ]
+        selected_nodes.extend(matching_nodes)
+# selected_nodes = [node for i, node in enumerate(nodes)
+#                   if usage[i] > node_thresold
+#                   or attribution_graph.nodes[node].node_type in ("InputNode", "OutputNode")
+#                   ]
 export_nodes = []
 for n in selected_nodes:
     export_nodes.append(attribution_graph.nodes[n])
 #%%
 export_edges = []
 for eid, e in attribution_graph.edges.items():
-    if not (e.source.id in selected_nodes or e.target.id in selected_nodes):
+    if not (e.source.id in selected_nodes and e.target.id in selected_nodes):
         continue
     if abs(influence[indices[e.target.id], indices[e.source.id]]) < edge_threshold:
         continue
@@ -314,12 +344,14 @@ import json
 save_dir = Path("../attribution-graphs-frontend")
 
 tokens = [tokenizer.decode([i]) for i in tokenized_prompt["input_ids"][0].tolist()]
-name = "some-name"
-prefix = ["<EOT>"]
+name = "test-1"
+# prefix = ["<EOT>"]
+prefix = []
+scan = "default"
 metadata = dict(
     slug=name,
     # scan="jackl-circuits-runs-1-4-sofa-v3_0",
-    scan="some-run",
+    scan=scan,
     prompt_tokens=prefix + tokens,
     prompt="".join(tokens),
     title_prefix="",
@@ -348,6 +380,18 @@ nodes_json = [
     ) for node in export_nodes
 ]
 
+def cantor(l, f):
+    return (l + f) * (l + f + 1) // 2 + f
+
+for node in nodes_json:
+    if node["feature_type"] != "cross layer transcoder":
+        continue
+    l, f = int(node["layer"]), int(node["feature"])
+    idx_cantor = cantor(l, f)
+    node["feature"] = idx_cantor
+    prefix, mid, suffix = node["node_id"].rpartition("_")
+    # node["node_id"] = prefix + mid + str(idx_cantor)
+
 links_json = [
     dict(
         source=e.source.id,
@@ -375,8 +419,81 @@ result = dict(
 
 open(save_dir / "graph_data" / f"{name}.json", "w").write(json.dumps(result))
 open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=[metadata])))
-
+#%%
+from collections import defaultdict
+# [attribution_graph.nodes[node] for
+module_latents = defaultdict(list)
+for selected_node in selected_nodes:
+    node = attribution_graph.nodes[selected_node]
+    if node.node_type == "IntermediateNode":
+        l, f = int(node.layer_index), int(node.feature_index)
+        print(cantor(l, f))
+        module_latents[hookpoints_layer[l].partition(".")[2] + ".mlp"].append(f)
+module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
+#%%
+module_latents.keys()
 # %%
+from delphi.latents import LatentDataset
+from delphi.config import SamplerConfig, ConstructorConfig
+from natsort import natsorted
+cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents"
+ds = LatentDataset(
+    cache_path,
+    SamplerConfig(), ConstructorConfig(),
+    modules=natsorted(module_latents.keys()),
+    latents=module_latents,
+)
 
-{k: v.norm(dim=-1).mean() for k, v in errors.items()}
-{k: v.norm(dim=-1).mean() for k, v in errors.items()}
+#%%
+logit_weight = model.lm_head.weight * model.model.norm.weight
+# %%
+from tqdm import tqdm
+bar = tqdm(total=sum(map(len, module_latents.values())))
+def process_feature(feature):
+    layer_idx = int(feature.latent.module_name.split(".")[-2])
+    feature_idx = feature.latent.latent_index
+    index = cantor(layer_idx, feature_idx)
+
+    feature_dir = save_dir / "features" / scan
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    feature_path = feature_dir / f"{index}.json"
+
+    if feature_path.exists():
+        examples_quantiles = json.loads(feature_path.read_text())["examples_quantiles"]
+    else:
+        examples_quantiles = defaultdict(list)
+        for example in feature.train:
+            examples_quantiles[example.quantile].append(dict(
+                is_repeated_datapoint=False,
+                train_token_index=len(example.tokens) - 1,
+                tokens=[tokenizer.decode([i]) for i in example.tokens.tolist()],
+                tokens_acts_list=example.activations.tolist(),
+            ))
+        examples_quantiles = [
+            dict(
+                quantile_name=f"Quantile {i}",
+                examples=examples_quantiles[i],
+            ) for i in sorted(examples_quantiles.keys())
+        ]
+    with torch.no_grad(), torch.autocast("cuda"):
+        dec_weight = transcoders[hookpoints_mlp[layer_idx]].W_dec[feature_idx]
+        logits = logit_weight @ dec_weight
+        top_logits = logits.topk(10).indices.tolist()
+        bottom_logits = logits.topk(10, largest=False).indices.tolist()
+    top_logits = [tokenizer.decode([i]) for i in top_logits]
+    bottom_logits = [tokenizer.decode([i]) for i in bottom_logits]
+
+    feature_vis = dict(
+        index=index,
+        examples_quantiles=examples_quantiles,
+        bottom_logits=bottom_logits,
+        top_logits=top_logits,
+    )
+    feature_path.write_text(json.dumps(feature_vis))
+    bar.update(1)
+    bar.refresh()
+
+async for feature in ds:
+    process_feature(feature)
+bar.close()
+# %%
