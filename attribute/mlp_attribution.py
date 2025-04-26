@@ -1,120 +1,35 @@
-from dataclasses import dataclass, replace
-import torch
-from torch import Tensor
-from collections import defaultdict
-from delphi.latents import LatentDataset
-from delphi.config import SamplerConfig, ConstructorConfig
-from natsort import natsorted
-from tqdm import tqdm
-import numpy as np
-from .nodes import (
-    OutputNode,
-    InputNode,
-    IntermediateNode,
-    ErrorNode,
-    Node,
-    Contribution,
-    Edge
-)
-from .caching import TranscodedModel, TranscodedOutputs
-from typing import Optional
-import random
-from .utils import measure_time, infcache, cantor
-from pathlib import Path
 import json
 import os
+import random
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Optional
 
+import numpy as np
+import torch
+from delphi.config import ConstructorConfig, SamplerConfig
+from delphi.latents import LatentDataset
+from loguru import logger
+from natsort import natsorted
+from torch import Tensor
+from tqdm.auto import tqdm, trange
 
-@dataclass
-class QueueElement:
-    source: Node
-    weight: float
-    parent: Optional["QueueElement"] = None
-
-    def __hash__(self):
-        return hash((self.source.id, self.weight, hash(self.parent)))
-
-    @property
-    @infcache
-    def contribution(self):
-        if self.parent is None:
-            return self.weight
-        else:
-            return self.weight * self.parent.contribution
-
-    @property
-    @infcache
-    def key(self):
-        key = self.contribution  # ** (1 / len(self.sequence))
-        if isinstance(self.source, IntermediateNode):
-            key *= abs(self.source.activation)
-        return -abs(key)
-
-    def __lt__(self, other):
-        return self.key < other.key
-
-    def __eq__(self, other):
-        return self.source.id == other.source.id
-
-    @property
-    @infcache
-    def sequence(self):
-        own = [self]
-        if self.parent is None:
-            return own
-        else:
-            return own + self.parent.sequence
-
-
-class NodeQueue:
-    def __init__(self):
-        self.visited = set()
-        self.unvisited = {}
-
-    def __len__(self):
-        return len(self.unvisited)
-
-    def pop(self):
-        all_layers = set(x.source.layer_index for x in self.unvisited.values())
-        random_layer = random.choice(list(all_layers))
-        unvisited = {x: y for x, y in self.unvisited.items() if y.source.layer_index == random_layer}
-        highest = min(unvisited, key=lambda x: self.unvisited[x].key)
-        if highest in self.visited:
-            del self.unvisited[highest]
-            return self.pop()
-        return self.unvisited.pop(highest)
-
-    def add(self, node: QueueElement):
-        if node.source.id in self.visited:
-            return
-        if node.source.id in self.unvisited:
-            if node.key < self.unvisited[node.source.id].key:
-                self.unvisited[node.source.id] = node
-        else:
-            self.unvisited[node.source.id] = node
-
-    def add_many(self, nodes: list[QueueElement], top_k: int = float("inf")):
-            with measure_time("Deduplicating", disabled=True):
-                new_sources = [x for x in nodes if x.source.id not in self.visited]
-            with measure_time("Creating keys to sort", disabled=True):
-                keys = [float(x.key) for x in new_sources]
-            with measure_time("Sorting", disabled=True):
-                if len(keys) > top_k:
-                    topk_sort = np.argpartition(keys, top_k)[:top_k]
-                else:
-                    topk_sort = np.arange(len(keys))
-                filtered_sources = [new_sources[i] for i in topk_sort]
-            with measure_time("Adding to queue", disabled=True):
-                for source in filtered_sources:
-                    self.add(source)
+from .caching import TranscodedModel, TranscodedOutputs
+from .nodes import (Contribution, Edge, ErrorNode, InputNode, IntermediateNode,
+                    Node, OutputNode)
+from .utils import cantor, infcache, measure_time
 
 
 @dataclass
 class AttributionConfig:
     # name of the run
-    name = "test-1"
+    name: str
     # ID for the model the features are from
-    scan = "default"
+    scan: str
+
+    # how many target nodes to compute contributions for
+    flow_steps: int = 2000
 
     # remove MLP edges below this threshold
     pre_filter_threshold: float = 1e-2
@@ -135,7 +50,7 @@ class AttributionGraph:
         self,
         model: TranscodedModel,
         cache: TranscodedOutputs,
-        config: AttributionConfig = AttributionConfig()
+        config: AttributionConfig
     ):
         self.config = config
         self.model = model
@@ -167,9 +82,9 @@ class AttributionGraph:
 
     def save_graph(self, save_dir: os.PathLike):
         save_dir = Path(save_dir)
-        print("Saving graph to", save_dir)
+        logger.info("Saving graph to", save_dir)
 
-        print("Deduplicating nodes")
+        logger.info("Deduplicating nodes")
         dedup_node_names = set()
         for edge in self.edges.values():
             if edge.weight == 0:
@@ -179,7 +94,7 @@ class AttributionGraph:
         dedup_node_names = list(dedup_node_names)
         dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
 
-        print("Finding adjacency matrix")
+        logger.info("Finding adjacency matrix")
         n_initial = len(dedup_node_names)
         adj_matrix = np.zeros((n_initial, n_initial))
         for edge in self.edges.values():
@@ -188,7 +103,7 @@ class AttributionGraph:
             adj_matrix[target_index, source_index] = abs(edge.weight)
         adj_matrix /= np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
 
-        print("Finding influence matrix")
+        logger.info("Finding influence matrix")
         if not hasattr(self, "influence"):
             identity = np.eye(n_initial)
             influence = np.linalg.inv(identity - adj_matrix) - identity
@@ -196,7 +111,7 @@ class AttributionGraph:
         else:
             influence = self.influence
 
-        print("Finding influence sources")
+        logger.info("Finding influence sources")
         influence_sources = np.zeros((n_initial,))
         for index, node in enumerate(dedup_node_names):
             node = self.nodes[node]
@@ -205,7 +120,7 @@ class AttributionGraph:
             influence_sources[index] = node.probability
         usage = influence_sources @ influence
 
-        print("Selecting nodes and edges")
+        logger.info("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
                   if self.nodes[node].node_type in ("InputNode", "OutputNode", "ErrorNode")]
         for seq_idx in range(self.cache.input_ids.shape[-1]):
@@ -242,7 +157,7 @@ class AttributionGraph:
             export_edges.append(edge)
         self.exported_edges = export_edges
 
-        print("Exporting graph")
+        logger.info("Exporting graph")
         tokens = [self.model.decode_token(i) for i in self.input_ids]
         # prefix = ["<EOT>"]
         prefix = []
@@ -305,8 +220,19 @@ class AttributionGraph:
             )
         )
 
-        open(save_dir / "graph_data" / f"{self.config.name}.json", "w").write(json.dumps(result))
-        open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=[metadata])))
+        graph_data_dir = save_dir / "graph_data"
+        circuit_path = graph_data_dir / f"{self.config.name}.json"
+        open(circuit_path, "w").write(json.dumps(result))
+
+        logger.info("Collecting metadata")
+        metadatas = []
+        own_file_index = 0
+        for i, save_file in enumerate(graph_data_dir.glob("*.json")):
+            metadatas.append(json.loads(save_file.read_text())["metadata"])
+            if save_file.stem == self.config.name:
+                own_file_index = i
+        metadatas[0], metadatas[own_file_index] = metadatas[own_file_index], metadatas[0]
+        open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=metadatas)))
 
     async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
         module_latents = defaultdict(list)
@@ -478,6 +404,10 @@ class AttributionGraph:
                 break
         self.output_nodes = output_nodes
 
+        # cleared each time we re-initialize the graph
+        self.queue = NodeQueue()
+        self.remaining_output_nodes = output_nodes.copy()
+
     def compute_mlp_node_contribution(
         self,
         node: Node,
@@ -583,7 +513,7 @@ class AttributionGraph:
 
     @torch.no_grad()
     @torch.autocast("cuda")
-    def flow_once(self, queue: NodeQueue, output_nodes: list[OutputNode]):
+    def flow_once(self):
 
         with measure_time(
             "Finding a node to compute contributions",
@@ -591,17 +521,16 @@ class AttributionGraph:
         ):
             # if the queue is empty, get the output node with the highest probability
             # TODO: handle the other output nodes
-            if len(output_nodes) > 0:
-                target_node = output_nodes.pop()
+            if len(self.output_nodes) > 0:
+                target_node = self.output_nodes.pop()
                 influence, target_node = 1, target_node
-                print("Doing output node")
+                logger.debug("Starting from output node")
                 target = None
             else:
-                # target, queue = queue[0], queue[1:]
-                target = queue.pop()
+                target = self.queue.pop()
                 influence, target_node = target.contribution, target.source
-                print(f"Doing target: {target_node.id} with influence {influence}")
-                print("Path:", [(x.source.id, x.weight) for x in target.sequence])
+                logger.debug(f"Doing target: {target_node.id} with influence {influence}")
+                logger.debug("Path:", [(x.source.id, x.weight) for x in target.sequence])
 
             # compute all the contributions
             max_layer = target_node.layer_index
@@ -694,18 +623,103 @@ class AttributionGraph:
                         )
                     )
 
-            queue.add_many(new_sources, self.config.top_k_edges)
+            self.queue.add_many(new_sources, self.config.top_k_edges)
 
-    def flow(self, num_iterations: int = 100000):
-        queue = NodeQueue()
-        output_nodes = self.output_nodes[:]
-        for i in range(num_iterations):
+    def flow(self, num_iterations: Optional[int] = None):
+        if num_iterations is None:
+            num_iterations = self.config.flow_steps
+        for i in (bar := trange(num_iterations, desc="Flowing contributions")):
             with measure_time(
                 f"Iteration {i}",
-                disabled=False,
+                disabled=True,
             ):
-                self.flow_once(queue, output_nodes)
-                print(f"Queue has {len(queue)} paths")
-            if not queue:
-                print("Queue is empty")
+                self.flow_once()
+                logger.debug(f"Queue has {len(self.queue)} paths")
+                bar.set_postfix(queue_elements=len(self.queue))
+            if not self.queue:
+                logger.info("Queue is empty")
                 break
+
+
+@dataclass
+class QueueElement:
+    source: Node
+    weight: float
+    parent: Optional["QueueElement"] = None
+
+    def __hash__(self):
+        return hash((self.source.id, self.weight, hash(self.parent)))
+
+    @property
+    @infcache
+    def contribution(self):
+        if self.parent is None:
+            return self.weight
+        else:
+            return self.weight * self.parent.contribution
+
+    @property
+    @infcache
+    def key(self):
+        key = self.contribution  # ** (1 / len(self.sequence))
+        if isinstance(self.source, IntermediateNode):
+            key *= abs(self.source.activation)
+        return -abs(key)
+
+    def __lt__(self, other):
+        return self.key < other.key
+
+    def __eq__(self, other):
+        return self.source.id == other.source.id
+
+    @property
+    @infcache
+    def sequence(self):
+        own = [self]
+        if self.parent is None:
+            return own
+        else:
+            return own + self.parent.sequence
+
+
+class NodeQueue:
+    def __init__(self):
+        self.visited = set()
+        self.unvisited = {}
+
+    def __len__(self):
+        return len(self.unvisited)
+
+    def pop(self):
+        all_layers = set(x.source.layer_index for x in self.unvisited.values())
+        random_layer = random.choice(list(all_layers))
+        unvisited = {x: y for x, y in self.unvisited.items() if y.source.layer_index == random_layer}
+        highest = min(unvisited, key=lambda x: self.unvisited[x].key)
+        if highest in self.visited:
+            del self.unvisited[highest]
+            return self.pop()
+        return self.unvisited.pop(highest)
+
+    def add(self, node: QueueElement):
+        if node.source.id in self.visited:
+            return
+        if node.source.id in self.unvisited:
+            if node.key < self.unvisited[node.source.id].key:
+                self.unvisited[node.source.id] = node
+        else:
+            self.unvisited[node.source.id] = node
+
+    def add_many(self, nodes: list[QueueElement], top_k: int = float("inf")):
+            with measure_time("Deduplicating", disabled=True):
+                new_sources = [x for x in nodes if x.source.id not in self.visited]
+            with measure_time("Creating keys to sort", disabled=True):
+                keys = [float(x.key) for x in new_sources]
+            with measure_time("Sorting", disabled=True):
+                if len(keys) > top_k:
+                    topk_sort = np.argpartition(keys, top_k)[:top_k]
+                else:
+                    topk_sort = np.arange(len(keys))
+                filtered_sources = [new_sources[i] for i in topk_sort]
+            with measure_time("Adding to queue", disabled=True):
+                for source in filtered_sources:
+                    self.add(source)

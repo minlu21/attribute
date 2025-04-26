@@ -1,7 +1,9 @@
-from functools import lru_cache
-from contextlib import contextmanager
 import time
+from contextlib import contextmanager
+from functools import lru_cache
+
 import torch
+from loguru import logger
 
 
 @contextmanager
@@ -11,7 +13,7 @@ def measure_time(name: str, disabled: bool = False):
     end_time = time.time()
     elapsed_time = end_time - start_time
     if not disabled:
-        print(f"{name}: {elapsed_time:.4f} seconds")
+        logger.debug(f"{name}: {elapsed_time:.4f} seconds")
 
 
 infcache = lru_cache(maxsize=None)

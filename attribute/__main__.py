@@ -1,9 +1,11 @@
-from .mlp_attribution import AttributionGraph
+import sys
 from pathlib import Path
-from .caching import TranscodedModel
+
 import fire
-from pathlib import Path
+from loguru import logger
+
 from .caching import TranscodedModel
+from .mlp_attribution import AttributionConfig, AttributionGraph
 
 
 async def main(
@@ -12,7 +14,16 @@ async def main(
     save_dir = Path("../attribution-graphs-frontend"),
     transcoder_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x",
     cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents",
+    name = "test-1",
+    scan = "default",
 ):
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+
+    config = AttributionConfig(
+        name=name,
+        scan=scan,
+    )
     model_name = "HuggingFaceTB/SmolLM2-135M"
     hookpoint_fn = lambda hookpoint: hookpoint.replace("model.layers.", "layers.")
     model = TranscodedModel(
@@ -22,8 +33,8 @@ async def main(
         device="cuda",
     )
     transcoded_outputs = model(prompt)
-    attribution_graph = AttributionGraph(model, transcoded_outputs)
-    attribution_graph.flow(2000)
+    attribution_graph = AttributionGraph(model, transcoded_outputs, config)
+    attribution_graph.flow()
     attribution_graph.save_graph(save_dir)
     await attribution_graph.cache_features(cache_path, save_dir)
 
