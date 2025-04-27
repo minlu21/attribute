@@ -158,11 +158,8 @@ class TranscodedModel(object):
             transcoder_acts = transcoder(input)
             # have to reshape output to get the batch dimension back
             transcoder_out = transcoder_acts.sae_out.view(output.shape)
-            # error = output - transcoder_out * output_norm[module_name]
-            skip = input.to(transcoder.W_skip.dtype) @ transcoder.W_skip.mT
-            error = output - (transcoder_out + skip)
+            error = output - transcoder_out
 
-            # activations = transcoder_acts.latent_acts * transcoder_out_constant
             transcoder_activations[module_name] = (
                 transcoder_acts.latent_acts.unflatten(0, batch_dims),
                 transcoder_acts.latent_indices.unflatten(0, batch_dims),
