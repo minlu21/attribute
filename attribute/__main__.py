@@ -11,7 +11,7 @@ from .mlp_attribution import AttributionConfig, AttributionGraph
 async def main(
     prompt="When John and Mary went to the store, John gave a bag to",
     model_name="HuggingFaceTB/SmolLM2-135M",
-    save_dir = Path("../attribution-graphs-frontend"),
+    save_dir = Path("attribution-graphs-frontend"),
     transcoder_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x",
     cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents",
     name = "test-1",
