@@ -567,6 +567,7 @@ class AttributionGraph:
                     gradient = gradient + skipped
                 gradient = self.backward(gradient, layer)
 
+        all_contributions = all_mlp_contributions
         with measure_time(
             f"Computing embedding contributions of node {target_node.id}",
             disabled=True,
@@ -585,7 +586,7 @@ class AttributionGraph:
                     source=embed_node, target=target_node, contribution=contribution
                 )
 
-                all_contributions = all_mlp_contributions + [embedding_contribution]
+                all_contributions.append(embedding_contribution)
 
         with measure_time(
             f"Summarizing contributions of node {target_node.id}",
