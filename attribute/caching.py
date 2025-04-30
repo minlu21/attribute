@@ -44,7 +44,13 @@ class TranscodedOutputs:
     mlp_outputs: dict[int, MLPOutputs]
     attn_outputs: dict[int, AttentionOutputs]
     last_layer_activations: Float[Array, "batch seq_len hidden_size"]
+    pre_final_ln: Float[Array, "batch seq_len hidden_size"]
+    final_ln: Float[Array, "batch seq_len hidden_size"]
     logits: Float[Array, "batch seq_len vocab_size"]
+
+    @property
+    def final_ln_factor(self):
+        return torch.nan_to_num(self.final_ln / self.pre_final_ln, nan=1.0, posinf=1.0, neginf=1.0)
 
     @property
     def seq_len(self):
@@ -63,6 +69,7 @@ class TranscodedModel(object):
         hookpoint_fn=None,
         device="cuda",
     ):
+        logger.info(f"Loading model {model_name} on device {device}")
         self.device = device
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -86,6 +93,7 @@ class TranscodedModel(object):
         self.temp_hookpoints_mlp = [
             hookpoint_fn(hookpoint) for hookpoint in self.hookpoints_mlp
         ]
+        logger.info(f"Loading transcoders from {transcoder_path}")
         transcoder_path = Path(transcoder_path)
         self.transcoders = {}
         for hookpoint, temp_hookpoint in zip(self.hookpoints_mlp, self.temp_hookpoints_mlp):
@@ -204,6 +212,13 @@ class TranscodedModel(object):
         for hookpoint in self.hookpoints_mlp:
             self.name_to_module[hookpoint].register_forward_hook(get_mlp_hook)
 
+        pre_final_ln, final_ln = None, None
+        def get_final_ln_hook(module, input, output):
+            nonlocal pre_final_ln, final_ln
+            pre_final_ln = input[0]
+            final_ln = output
+        self.final_ln.register_forward_hook(get_final_ln_hook)
+
         outputs = self.model(**tokenized_prompt, output_attentions=True, output_hidden_states=True)
         self.clear_hooks()
 
@@ -236,6 +251,8 @@ class TranscodedModel(object):
             mlp_outputs=mlp_outputs,
             attn_outputs=attn_outputs,
             last_layer_activations=last_layer_activations,
+            pre_final_ln=pre_final_ln,
+            final_ln=final_ln,
             logits=logits,
         )
 
@@ -282,11 +299,20 @@ class TranscodedModel(object):
         return isinstance(self.model, GPTNeoPreTrainedModel)
 
     @property
+    def final_ln(self):
+        if isinstance(self.model, LlamaPreTrainedModel):
+            return self.model.model.norm
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return self.model.transformer.ln_f
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    @property
     def logit_weight(self):
         if isinstance(self.model, LlamaPreTrainedModel):
-            return self.model.lm_head.weight * self.model.model.norm.weight
+            return self.model.lm_head.weight * self.final_ln.weight
         elif isinstance(self.model, GPTNeoPreTrainedModel):
-            return self.model.lm_head.weight * self.model.transformer.ln_f.weight
+            return self.model.lm_head.weight * self.final_ln.weight
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
@@ -322,6 +348,8 @@ class TranscodedModel(object):
 
     def w_skip(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "hidden_size hidden_size"]:
         try:
+            if target_layer_idx != layer_idx + 1:
+                raise IndexError
             return self.transcoders[self.hookpoints_mlp[layer_idx]].W_skip
         except AttributeError:
             assert target_layer_idx is not None, "target_layer_idx must be provided for multi-target transcoders"

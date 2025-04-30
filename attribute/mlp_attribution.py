@@ -4,7 +4,7 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 import numpy as np
 import torch
@@ -30,18 +30,21 @@ class AttributionConfig:
 
     # how many target nodes to compute contributions for
     flow_steps: int = 2000
+    # whether to use the softmax gradient for the output node
+    # instead of the logit
+    softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
 
     # remove MLP edges below this threshold
-    pre_filter_threshold: float = 1e-7
+    pre_filter_threshold: float = 1e-4
     # keep edges above this threshold
-    edge_threshold = 1e-7
+    edge_threshold = 1e-4
     # keep top k edges for each node
     top_k_edges: int = 256
 
     # always keep nodes above this threshold of influence
-    node_threshold = 1e-4
+    node_threshold = 1e-3
     # keep per_layer_position nodes above this threshold for each layer/position pair
-    secondary_threshold = 1e-6
+    secondary_threshold = 1e-5
     per_layer_position = 2
 
 
@@ -244,7 +247,6 @@ class AttributionGraph:
                 module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
 
-        print(module_latents.keys(), cache_path)
         ds = LatentDataset(
             cache_path,
             SamplerConfig(), ConstructorConfig(),
@@ -378,11 +380,19 @@ class AttributionGraph:
         total_probability = 0
         output_nodes = []
         for i in range(10):
-            # "logit_i - mean logit"; what does "mean logit" mean?
-            # i assume it is the mean according to the softmax distribution
-            # because that is the gradient of softmax ignoring the scaling factor
-            before_gradient = self.logits[-1, top_10_indices[i]] - \
-                torch.dot(self.logits[-1, :], self.logits[-1, :].softmax(dim=-1).detach())
+            match self.config.softmax_grad_type:
+                case "softmax":
+                    # "logit_i - mean logit"; what does "mean logit" mean?
+                    # i assume it is the mean according to the softmax distribution
+                    # because that is the gradient of softmax ignoring the scaling factor
+                    before_gradient = self.logits[-1, top_10_indices[i]] - \
+                        torch.dot(self.logits[-1, :], self.logits[-1, :].softmax(dim=-1).detach())
+                case "mean":
+                    # https://transformer-circuits.pub/2025/attribution-graphs/methods.html
+                    # #appendix-attribution-graph-computation
+                    before_gradient = self.logits[-1, top_10_indices[i]] - torch.mean(self.logits[-1, :])
+                case "straight":
+                    before_gradient = self.logits[-1, top_10_indices[i]]
             before_gradient.backward(retain_graph=True)
             gradient = self.cache.last_layer_activations.grad
             assert gradient is not None
@@ -536,8 +546,6 @@ class AttributionGraph:
 
             # compute all the contributions
             max_layer = target_node.layer_index
-            if isinstance(target_node, OutputNode):
-                max_layer -= 1
             gradient = target_node.input_vector
             if gradient.ndim == 1:
                 gradient = gradient.unsqueeze(0)
@@ -549,7 +557,12 @@ class AttributionGraph:
                         == target_node.token_position
                     )[:, None]
                 )
-            gradient = gradient * self.cache.mlp_outputs[max_layer].ln_factor
+            if not isinstance(target_node, OutputNode):
+                gradient = gradient * self.cache.mlp_outputs[max_layer].ln_factor
+            else:
+                # just to fix the shape (insert batch dimension),
+                # the gradient is already scaled by the ln_factor
+                gradient = gradient * torch.ones_like(self.cache.final_ln_factor)
         all_mlp_contributions = {}
         past_gradients = {}
         with measure_time(
@@ -557,20 +570,13 @@ class AttributionGraph:
             disabled=True,
         ):
             for layer in tqdm(
-                range(max_layer, -1, -1),
+                range(min(max_layer, self.model.num_layers - 1), -1, -1),
                 desc=f"Computing MLP contributions of node {target_node.id}",
                 disable=True,
             ):
                 start_gradient = gradient
-                past_gradients[layer] = start_gradient
                 if layer != max_layer:
-                    mlp_contributions = self.mlp_contribution(gradient, layer)
-                    for k, v in mlp_contributions.items():
-                        if k in all_mlp_contributions:
-                            all_mlp_contributions[k].contribution += v.contribution
-                        else:
-                            all_mlp_contributions[k] = v
-
+                    # 1) process skip weights from future layers
                     skipped = 0
                     to_delete = set()
                     for target_layer, grad in past_gradients.items():
@@ -582,6 +588,18 @@ class AttributionGraph:
                         del past_gradients[target_layer]
                     skipped = skipped * self.cache.mlp_outputs[layer].ln_factor
                     gradient = gradient + skipped
+
+                    # 2) find MLP sources on the current layer
+                    mlp_contributions = self.mlp_contribution(gradient, layer)
+                    for k, v in mlp_contributions.items():
+                        if k in all_mlp_contributions:
+                            all_mlp_contributions[k].contribution += v.contribution
+                        else:
+                            all_mlp_contributions[k] = v
+
+                # 3) pass skip gradient to the previous layer
+                past_gradients[layer] = start_gradient
+
                 if self.model.parallel_attn:
                     gradient += self.attn_backward(start_gradient, layer)
                 else:
