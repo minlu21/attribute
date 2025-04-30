@@ -81,7 +81,6 @@ class IntermediateNode(Node):
     feature_index: int
     activation: Tensor
     input_vector: Tensor
-    output_vector: Tensor
 
 
 @dataclass

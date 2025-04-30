@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+uv run python -m attribute "<|endoftext|>Once upon a" \
+--model_name="roneneldan/TinyStories-33M" \
+--transcoder_path="../e2e/checkpoints/clt-ts/ts" --cache_path=results/transcoder_128x/latents \

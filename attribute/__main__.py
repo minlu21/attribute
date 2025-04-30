@@ -14,7 +14,7 @@ async def main(
     save_dir = Path("attribution-graphs-frontend"),
     transcoder_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/sparsify/checkpoints/single_128x",
     cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents",
-    name = "test-1",
+    name = "test-1-ts",
     scan = "default",
 ):
     logger.remove()
@@ -24,12 +24,9 @@ async def main(
         name=name,
         scan=scan,
     )
-    model_name = "HuggingFaceTB/SmolLM2-135M"
-    hookpoint_fn = lambda hookpoint: hookpoint.replace("model.layers.", "layers.")
     model = TranscodedModel(
         model_name=model_name,
         transcoder_path=transcoder_path,
-        hookpoint_fn=hookpoint_fn,
         device="cuda",
     )
     transcoded_outputs = model(prompt)

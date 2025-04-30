@@ -7,6 +7,9 @@ import torch
 from jaxtyping import Array, Float, Int
 from sparsify import SparseCoder
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.llama import LlamaPreTrainedModel
+from transformers.models.gpt_neo import GPTNeoPreTrainedModel
+from loguru import logger
 
 from .utils import repeat_kv
 
@@ -21,7 +24,7 @@ class MLPOutputs:
 
     @property
     def ln_factor(self):
-        return torch.nan_to_num(self.second_ln / self.pre_second_ln)
+        return torch.nan_to_num(self.second_ln / self.pre_second_ln, nan=1.0, posinf=1.0, neginf=1.0)
 
 
 @dataclass
@@ -33,7 +36,7 @@ class AttentionOutputs:
 
     @property
     def ln_factor(self):
-        return torch.nan_to_num(self.first_ln / self.pre_first_ln)
+        return torch.nan_to_num(self.first_ln / self.pre_first_ln, nan=1.0, posinf=1.0, neginf=1.0)
 
 @dataclass
 class TranscodedOutputs:
@@ -57,7 +60,7 @@ class TranscodedModel(object):
         self,
         model_name: str | os.PathLike,
         transcoder_path: os.PathLike,
-        hookpoint_fn=lambda x: x,
+        hookpoint_fn=None,
         device="cuda",
     ):
         self.device = device
@@ -70,7 +73,16 @@ class TranscodedModel(object):
         self.model = model
         self.tokenizer = tokenizer
 
-        self.hookpoints_mlp = [f"model.layers.{i}.mlp" for i in range(self.num_layers)]
+        if hookpoint_fn is None:
+            def hookpoint_fn(hookpoint):
+                if isinstance(model, LlamaPreTrainedModel):
+                    return hookpoint.replace("model.layers.", "layers.")
+                elif isinstance(model, GPTNeoPreTrainedModel):
+                    return hookpoint.replace("transformer.h.", "h.")
+                else:
+                    logger.warning(f"Unknown model type: {type(model)}. Using default hookpoint.")
+                    return hookpoint
+        self.hookpoints_mlp = [f"{self.layer_prefix}.{i}.mlp" for i in range(self.num_layers)]
         self.temp_hookpoints_mlp = [
             hookpoint_fn(hookpoint) for hookpoint in self.hookpoints_mlp
         ]
@@ -82,8 +94,8 @@ class TranscodedModel(object):
                 device=device,
             )
             self.transcoders[hookpoint] = sae
-        self.hookpoints_layer = [f"model.layers.{i}" for i in range(self.num_layers)]
-        self.hookpoints_ln = [f"model.layers.{i}.post_attention_layernorm" for i in range(self.num_layers)]
+        self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
+        self.hookpoints_ln = [f"{self.layer_prefix}.{i}.{self.mlp_layernorm_name}" for i in range(self.num_layers)]
         self.name_to_module = {
             name: model.get_submodule(name) for name in self.hookpoints_layer + self.hookpoints_mlp + self.hookpoints_ln
         }
@@ -104,6 +116,8 @@ class TranscodedModel(object):
 
     @property
     def repeat_kv(self):
+        if not hasattr(self.model.config, "num_key_value_heads"):
+            return 1
         return self.model.config.num_attention_heads // self.model.config.num_key_value_heads
 
     def __call__(self, prompt: str) -> TranscodedOutputs:
@@ -117,17 +131,19 @@ class TranscodedModel(object):
         def get_attention_values_hook(module, input, output):
             # this hook is in the layer
             residual = input[0]
-            pre_first_ln[self.module_to_name[module]] = residual
-            layer_normed = module.input_layernorm(residual)
-            first_ln[self.module_to_name[module]] = layer_normed
+            layer_name = self.module_to_name[module]
+            pre_first_ln[layer_name] = residual
+            layer_normed = getattr(module, self.attn_layernorm_name)(residual)
+            first_ln[layer_name] = layer_normed
 
             # stuff related to attention
             input_shape = layer_normed.shape[:-1]
-            hidden_shape = (*input_shape, -1, module.self_attn.head_dim)
+            hidden_shape = (*input_shape, -1, self.head_dim)
 
-            value_states = module.self_attn.v_proj(layer_normed).view(hidden_shape).transpose(1, 2)
+            layer_idx = self.name_to_index[layer_name]
+            value_states = self.attn(layer_idx).v_proj(layer_normed).view(hidden_shape).transpose(1, 2)
             values = repeat_kv(value_states, self.repeat_kv)
-            attn_values[self.module_to_name[module]] = values
+            attn_values[layer_name] = values
 
         for hookpoint in self.hookpoints_layer:
             self.name_to_module[hookpoint].register_forward_hook(get_attention_values_hook)
@@ -142,6 +158,7 @@ class TranscodedModel(object):
         for hookpoint in self.hookpoints_ln:
             self.name_to_module[hookpoint].register_forward_hook(get_ln2_hook)
 
+        transcoder_outputs = {}
         transcoder_activations = {}
         errors = {}
 
@@ -156,8 +173,25 @@ class TranscodedModel(object):
             input = input.view(-1, input.shape[-1])
             # have to normalize input
             transcoder_acts = transcoder(input)
+            transcoder_outputs[module_name] = transcoder_acts
+
+            sae_out = 0
+            to_delete = set()
+            for k, v in transcoder_outputs.items():
+                out = v(
+                    None,
+                    addition=0 if k != module_name else sae_out,
+                )
+                if k == module_name:
+                    sae_out = out.sae_out
+                else:
+                    sae_out += out.sae_out
+                if out.is_last:
+                    to_delete.add(k)
+            for k in to_delete:
+                del transcoder_outputs[k]
             # have to reshape output to get the batch dimension back
-            transcoder_out = transcoder_acts.sae_out.view(output.shape)
+            transcoder_out = sae_out.view(output.shape)
             error = output - transcoder_out
 
             transcoder_activations[module_name] = (
@@ -208,12 +242,53 @@ class TranscodedModel(object):
         return transcoded_outputs
 
     @property
+    def layer_prefix(self):
+        if isinstance(self.model, LlamaPreTrainedModel):
+            return "model.layers"
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return "transformer.h"
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    @property
+    def attn_layernorm_name(self):
+        if isinstance(self.model, LlamaPreTrainedModel):
+            return "input_layernorm"
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return "ln_1"
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    @property
+    def mlp_layernorm_name(self):
+        if isinstance(self.model, LlamaPreTrainedModel):
+            return "post_attention_layernorm"
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return "ln_2"
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    @property
     def embedding_weight(self):
-        return self.model.model.embed_tokens.weight
+        if isinstance(self.model, LlamaPreTrainedModel):
+            return self.model.model.embed_tokens.weight
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return self.model.transformer.wte.weight
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    @property
+    def parallel_attn(self):
+        return isinstance(self.model, GPTNeoPreTrainedModel)
 
     @property
     def logit_weight(self):
-        return self.model.lm_head.weight * self.model.model.norm.weight
+        if isinstance(self.model, LlamaPreTrainedModel):
+            return self.model.lm_head.weight * self.model.model.norm.weight
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return self.model.lm_head.weight * self.model.transformer.ln_f.weight
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     @property
     def hidden_size(self):
@@ -227,21 +302,56 @@ class TranscodedModel(object):
     def head_dim(self):
         return self.model.config.hidden_size // self.model.config.num_attention_heads
 
-    def w_dec(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
-        return self.transcoders[self.hookpoints_mlp[layer_idx]].W_dec
+    def w_dec(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "features hidden_size"]:
+        try:
+            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_dec
+        except AttributeError:
+            if target_layer_idx is None:
+                target_layer_idx = layer_idx
+                weight_combined = 0
+                while True:
+                    try:
+                        weight_combined += self.w_dec(layer_idx, target_layer_idx)
+                    except IndexError:
+                        break
+                    target_layer_idx += 1
+                return weight_combined
+            # assume the target layer is contiguous
+            assert target_layer_idx >= layer_idx
+            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_decs[target_layer_idx - layer_idx]
+
+    def w_skip(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "hidden_size hidden_size"]:
+        try:
+            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_skip
+        except AttributeError:
+            assert target_layer_idx is not None, "target_layer_idx must be provided for multi-target transcoders"
+            assert target_layer_idx >= layer_idx
+            w_skip = self.transcoders[self.hookpoints_mlp[layer_idx]].W_skips[target_layer_idx - layer_idx]
+            return w_skip
 
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
         return self.transcoders[self.hookpoints_mlp[layer_idx]].encoder.weight
 
-    def w_skip(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
-        return self.transcoders[self.hookpoints_mlp[layer_idx]].W_skip
+    def attn(self, layer_idx: int) -> torch.nn.Module:
+        layer = self.model.get_submodule(self.layer_prefix)[layer_idx]
+        if isinstance(self.model, LlamaPreTrainedModel):
+            return layer.self_attn
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return layer.attn.attention
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     def attn_output(self, layer_idx: int) -> Float[Array, "hidden_size num_attention_heads head_dim"]:
-        w_o = self.model.model.layers[layer_idx].self_attn.o_proj.weight
+        if isinstance(self.model, LlamaPreTrainedModel):
+            w_o = self.attn(layer_idx).o_proj.weight
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            w_o = self.attn(layer_idx).out_proj.weight
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
         return w_o.reshape(self.hidden_size, self.num_attention_heads, self.head_dim)
 
     def attn_value(self, layer_idx: int) -> Float[Array, "num_attention_heads head_dim hidden_size"]:
-        w_v = self.model.model.layers[layer_idx].self_attn.v_proj.weight
+        w_v = self.attn(layer_idx).v_proj.weight
         w_v = torch.repeat_interleave(w_v, self.repeat_kv, dim=0)
         return w_v.reshape(self.num_attention_heads, self.head_dim, self.hidden_size)
 

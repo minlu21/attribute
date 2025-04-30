@@ -32,17 +32,17 @@ class AttributionConfig:
     flow_steps: int = 2000
 
     # remove MLP edges below this threshold
-    pre_filter_threshold: float = 1e-2
+    pre_filter_threshold: float = 1e-7
+    # keep edges above this threshold
+    edge_threshold = 1e-7
     # keep top k edges for each node
-    top_k_edges: int = 64
+    top_k_edges: int = 256
 
     # always keep nodes above this threshold of influence
-    node_threshold = 1e-2
+    node_threshold = 1e-4
     # keep per_layer_position nodes above this threshold for each layer/position pair
-    secondary_threshold = 1e-4
+    secondary_threshold = 1e-6
     per_layer_position = 2
-    # keep edges above this threshold
-    edge_threshold = 1e-3
 
 
 class AttributionGraph:
@@ -87,21 +87,20 @@ class AttributionGraph:
         logger.info("Deduplicating nodes")
         dedup_node_names = set()
         for edge in self.edges.values():
-            if edge.weight == 0:
-                continue
             dedup_node_names.add(edge.source.id)
             dedup_node_names.add(edge.target.id)
         dedup_node_names = list(dedup_node_names)
         dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
 
         logger.info("Finding adjacency matrix")
+        logger.info(f"Number of nodes: {len(dedup_node_names)}")
         n_initial = len(dedup_node_names)
         adj_matrix = np.zeros((n_initial, n_initial))
         for edge in self.edges.values():
             target_index = dedup_node_indices[edge.target.id]
             source_index = dedup_node_indices[edge.source.id]
             adj_matrix[target_index, source_index] = abs(edge.weight)
-        adj_matrix /= np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
+        adj_matrix /= np.maximum(1e-2, np.nan_to_num(adj_matrix.sum(axis=1, keepdims=True)))
 
         logger.info("Finding influence matrix")
         if not hasattr(self, "influence"):
@@ -119,6 +118,7 @@ class AttributionGraph:
                 continue
             influence_sources[index] = node.probability
         usage = influence_sources @ influence
+        logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
 
         logger.info("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
@@ -142,6 +142,7 @@ class AttributionGraph:
                     if usage[dedup_node_indices[node]] > self.config.secondary_threshold
                 ]
                 selected_nodes.extend(matching_nodes)
+        logger.info(f"Selected {len(selected_nodes)} nodes")
 
         export_nodes = []
         for n in selected_nodes:
@@ -156,6 +157,7 @@ class AttributionGraph:
                 continue
             export_edges.append(edge)
         self.exported_edges = export_edges
+        logger.info(f"Selected {len(export_edges)} edges")
 
         logger.info("Exporting graph")
         tokens = [self.model.decode_token(i) for i in self.input_ids]
@@ -242,6 +244,7 @@ class AttributionGraph:
                 module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
 
+        print(module_latents.keys(), cache_path)
         ds = LatentDataset(
             cache_path,
             SamplerConfig(), ConstructorConfig(),
@@ -341,7 +344,6 @@ class AttributionGraph:
                 zip(activations_tensor.tolist(), indices_tensor.tolist())
             ):
                 for act, index in zip(top_acts, top_indices):
-                    decoder_direction = self.model.w_dec(layer)[index]
                     encoder_direction = self.model.w_enc(layer)[index]
                     intermediate_node = IntermediateNode(
                         id=f"intermediate_{token_position}_{layer}_{index}",
@@ -350,7 +352,6 @@ class AttributionGraph:
                         token_position=token_position,
                         activation=float(act),
                         input_vector=encoder_direction.to(dtype=torch.bfloat16),
-                        output_vector=decoder_direction.to(dtype=torch.bfloat16),
                     )
                     self.nodes[intermediate_node.id] = intermediate_node
                     self.nodes_by_layer_and_token[layer][token_position].append(
@@ -414,8 +415,8 @@ class AttributionGraph:
         target_node: Node,
         vector: Tensor,
     ) -> Contribution:
-        dot_product = torch.dot(vector, node.output_vector)
-        attribution = dot_product
+        dot_product = torch.dot(vector.float(), node.output_vector.float())
+        attribution = dot_product.item()
 
         return Contribution(
             source=node,
@@ -425,8 +426,8 @@ class AttributionGraph:
 
     def mlp_contribution(
         self, contribution_vector: torch.Tensor, layer_index: int
-    ) -> list[Contribution]:
-        contributions = []
+    ) -> dict[str, Contribution]:
+        contributions = {}
 
         for token_position in range(contribution_vector.shape[-2]):
             contribution_direction = contribution_vector[..., token_position, :]
@@ -447,41 +448,42 @@ class AttributionGraph:
                     None,
                     contribution_direction,
                 )
-                contributions.append(new_contribution)
+                contributions[new_contribution.source.id] = new_contribution
 
-        acts = self.activation_indices_tensors[layer_index]
-        activations, indices = acts["activations"], acts["indices"]
-        while activations.ndim > 2:
-            activations = activations[0]
-            indices = indices[0]
         contribution = contribution_vector
         while contribution.ndim > 2:
             contribution = contribution[0]
-        w_dec = self.model.w_dec(layer_index)
-        similarities = torch.einsum(
-            "...fd,...d->...f",
-            w_dec[indices]
-            * activations[..., None]
-            , contribution)
-        time_idx, feature_idx = torch.nonzero(similarities.abs() >= self.config.pre_filter_threshold, as_tuple=True)
-        time_idx, feature_idx = time_idx.tolist(), feature_idx.tolist()
-        sims = similarities[time_idx, feature_idx].tolist()
-        indexes = indices[time_idx, feature_idx]
-        for t, f, s, i in zip(time_idx, feature_idx, sims, indexes):
-            source = self.nodes[f"intermediate_{t}_{layer_index}_{i}"]
+        for source_layer in range(layer_index + 1):
+            acts = self.activation_indices_tensors[source_layer]
+            activations, indices = acts["activations"], acts["indices"]
+            while activations.ndim > 2:
+                activations = activations[0]
+                indices = indices[0]
+            w_dec = self.model.w_dec(source_layer, layer_index)
+            similarities = torch.einsum(
+                "...fd,...d->...f",
+                w_dec[indices]
+                * activations[..., None]
+                , contribution)
+            time_idx, feature_idx = torch.nonzero(similarities.abs() >= self.config.pre_filter_threshold, as_tuple=True)
+            sims = similarities[time_idx, feature_idx].tolist()
+            time_idx = time_idx.tolist()
+            indexes = indices[time_idx, feature_idx].tolist()
+            for t, s, i in zip(time_idx, sims, indexes):
+                source_id = f"intermediate_{t}_{source_layer}_{i}"
+                source = self.nodes[source_id]
+                contributions[source_id] = Contribution(
+                    source=source,
+                    target=None,
+                    contribution=s / source.activation
+                )
 
-            contributions.append(Contribution(
-                source=source,
-                target=None,
-                contribution=s / source.activation
-            ))
+        return {
+            k: replace(contribution, contribution=float(contribution.contribution))
+            for k, contribution in contributions.items()
+        }
 
-        return [
-            replace(contribution, contribution=float(contribution.contribution))
-            for contribution in contributions
-        ]
-
-    def backward(
+    def attn_backward(
         self,
         # batch size, seq_len, d_model
         vector: Tensor,
@@ -509,12 +511,11 @@ class AttributionGraph:
         )
         attn_pre_proj_gradient = attn_pre_proj_gradient * self.cache.attn_outputs[layer_index].ln_factor
 
-        return attn_pre_proj_gradient + vector
+        return attn_pre_proj_gradient
 
     @torch.no_grad()
     @torch.autocast("cuda")
     def flow_once(self):
-
         with measure_time(
             "Finding a node to compute contributions",
             disabled=True,
@@ -522,15 +523,16 @@ class AttributionGraph:
             # if the queue is empty, get the output node with the highest probability
             # TODO: handle the other output nodes
             if len(self.output_nodes) > 0:
-                target_node = self.output_nodes.pop()
-                influence, target_node = 1, target_node
+                influence, target_node = 1, self.output_nodes.pop()
                 logger.debug("Starting from output node")
-                target = None
+                target_elem = None
             else:
-                target = self.queue.pop()
-                influence, target_node = target.contribution, target.source
+                if len(self.queue) == 0:
+                    return False
+                target_elem = self.queue.pop()
+                influence, target_node = target_elem.contribution, target_elem.source
                 logger.debug(f"Doing target: {target_node.id} with influence {influence}")
-                logger.debug("Path:", [(x.source.id, x.weight) for x in target.sequence])
+                logger.debug("Path:", [(x.source.id, x.weight) for x in target_elem.sequence])
 
             # compute all the contributions
             max_layer = target_node.layer_index
@@ -548,7 +550,8 @@ class AttributionGraph:
                     )[:, None]
                 )
             gradient = gradient * self.cache.mlp_outputs[max_layer].ln_factor
-        all_mlp_contributions = []
+        all_mlp_contributions = {}
+        past_gradients = {}
         with measure_time(
             f"Computing MLP contributions of node {target_node.id}",
             disabled=True,
@@ -558,16 +561,33 @@ class AttributionGraph:
                 desc=f"Computing MLP contributions of node {target_node.id}",
                 disable=True,
             ):
+                start_gradient = gradient
+                past_gradients[layer] = start_gradient
                 if layer != max_layer:
-                    contributions = self.mlp_contribution(gradient, layer)
-                    all_mlp_contributions.extend(contributions)
+                    mlp_contributions = self.mlp_contribution(gradient, layer)
+                    for k, v in mlp_contributions.items():
+                        if k in all_mlp_contributions:
+                            all_mlp_contributions[k].contribution += v.contribution
+                        else:
+                            all_mlp_contributions[k] = v
 
-                    skipped = gradient @ self.model.w_skip(layer)
+                    skipped = 0
+                    to_delete = set()
+                    for target_layer, grad in past_gradients.items():
+                        try:
+                            skipped += grad @ self.model.w_skip(layer, target_layer)
+                        except IndexError:
+                            to_delete.add(target_layer)
+                    for target_layer in to_delete:
+                        del past_gradients[target_layer]
                     skipped = skipped * self.cache.mlp_outputs[layer].ln_factor
                     gradient = gradient + skipped
-                gradient = self.backward(gradient, layer)
+                if self.model.parallel_attn:
+                    gradient += self.attn_backward(start_gradient, layer)
+                else:
+                    gradient += self.attn_backward(gradient, layer)
 
-        all_contributions = all_mlp_contributions
+        all_contributions = list(all_mlp_contributions.values())
         with measure_time(
             f"Computing embedding contributions of node {target_node.id}",
             disabled=True,
@@ -580,7 +600,7 @@ class AttributionGraph:
                     if isinstance(node, InputNode)
                 ][0]
                 contribution = torch.dot(
-                    gradient[0, preceding_position, :], embed_node.output_vector
+                    gradient[0, preceding_position, :].float(), embed_node.output_vector.float()
                 ).item()
                 embedding_contribution = Contribution(
                     source=embed_node, target=target_node, contribution=contribution
@@ -620,11 +640,13 @@ class AttributionGraph:
                         QueueElement(
                             source=new_source,
                             weight=abs(new_contribution.contribution),
-                            parent=target,
+                            parent=target_elem,
                         )
                     )
 
             self.queue.add_many(new_sources, self.config.top_k_edges)
+
+        return len(self.queue) > 0 or target_elem is None
 
     def flow(self, num_iterations: Optional[int] = None):
         if num_iterations is None:
@@ -634,12 +656,11 @@ class AttributionGraph:
                 f"Iteration {i}",
                 disabled=True,
             ):
-                self.flow_once()
+                if not self.flow_once():
+                    logger.debug("Queue is empty")
+                    break
                 logger.debug(f"Queue has {len(self.queue)} paths")
                 bar.set_postfix(queue_elements=len(self.queue))
-            if not self.queue:
-                logger.info("Queue is empty")
-                break
 
 
 @dataclass
