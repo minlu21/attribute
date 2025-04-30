@@ -317,6 +317,10 @@ class TranscodedModel(object):
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     @property
+    def vocab_size(self):
+        return self.model.config.vocab_size
+
+    @property
     def hidden_size(self):
         return self.model.config.hidden_size
 
@@ -328,18 +332,22 @@ class TranscodedModel(object):
     def head_dim(self):
         return self.model.config.hidden_size // self.model.config.num_attention_heads
 
+    @torch.no_grad()
+    @torch.autocast("cuda")
     def w_dec(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "features hidden_size"]:
         try:
             return self.transcoders[self.hookpoints_mlp[layer_idx]].W_dec
         except AttributeError:
             if target_layer_idx is None:
+                logger.warning("Summing decoder weights because target_layer_idx is None")
                 target_layer_idx = layer_idx
-                weight_combined = 0
-                while True:
-                    try:
-                        weight_combined += self.w_dec(layer_idx, target_layer_idx)
-                    except IndexError:
-                        break
+                weight_combined = torch.zeros((self.w_dec(layer_idx, layer_idx).shape[0], self.hidden_size,), device=self.device, dtype=torch.float32)
+                weights_at_layers = {}
+                while target_layer_idx < self.num_layers:
+                    weights_at_layers[target_layer_idx] = weight_combined
+                    for layer_from, weight_at in weights_at_layers.items():
+                        weight_combined += weight_at @ self.w_skip(layer_from, target_layer_idx).T
+                    weight_combined += self.w_dec(layer_idx, target_layer_idx)
                     target_layer_idx += 1
                 return weight_combined
             # assume the target layer is contiguous
@@ -348,14 +356,16 @@ class TranscodedModel(object):
 
     def w_skip(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "hidden_size hidden_size"]:
         try:
-            if target_layer_idx != layer_idx + 1:
-                raise IndexError
-            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_skip
+            self.hookpoints_mlp[layer_idx].W_skip
         except AttributeError:
             assert target_layer_idx is not None, "target_layer_idx must be provided for multi-target transcoders"
             assert target_layer_idx >= layer_idx
             w_skip = self.transcoders[self.hookpoints_mlp[layer_idx]].W_skips[target_layer_idx - layer_idx]
             return w_skip
+        else:
+            if target_layer_idx != layer_idx:
+                raise IndexError
+            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_skip
 
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
         return self.transcoders[self.hookpoints_mlp[layer_idx]].encoder.weight

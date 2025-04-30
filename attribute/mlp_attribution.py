@@ -284,7 +284,11 @@ class AttributionGraph:
                     ) for i in sorted(examples_quantiles.keys())
                 ]
             with torch.no_grad(), torch.autocast("cuda"):
-                dec_weight = self.model.w_dec(layer_idx)[feature_idx]
+                try:
+                    logger.disable("attribute.caching")
+                    dec_weight = self.model.w_dec(layer_idx)[feature_idx]
+                finally:
+                    logger.enable("attribute.caching")
                 logits = logit_weight @ dec_weight
                 top_logits = logits.topk(10).indices.tolist()
                 bottom_logits = logits.topk(10, largest=False).indices.tolist()
@@ -575,8 +579,18 @@ class AttributionGraph:
                 disable=True,
             ):
                 start_gradient = gradient
+                # pass skip gradient (just after the MLP) to the previous layer
+                past_gradients[layer] = start_gradient
                 if layer != max_layer:
-                    # 1) process skip weights from future layers
+                    # find MLP sources on the current layer
+                    mlp_contributions = self.mlp_contribution(gradient, layer)
+                    for k, v in mlp_contributions.items():
+                        if k in all_mlp_contributions:
+                            all_mlp_contributions[k].contribution += v.contribution
+                        else:
+                            all_mlp_contributions[k] = v
+
+                    # process skip weights from future layers
                     skipped = 0
                     to_delete = set()
                     for target_layer, grad in past_gradients.items():
@@ -588,17 +602,6 @@ class AttributionGraph:
                         del past_gradients[target_layer]
                     skipped = skipped * self.cache.mlp_outputs[layer].ln_factor
                     gradient = gradient + skipped
-
-                    # 2) find MLP sources on the current layer
-                    mlp_contributions = self.mlp_contribution(gradient, layer)
-                    for k, v in mlp_contributions.items():
-                        if k in all_mlp_contributions:
-                            all_mlp_contributions[k].contribution += v.contribution
-                        else:
-                            all_mlp_contributions[k] = v
-
-                # 3) pass skip gradient to the previous layer
-                past_gradients[layer] = start_gradient
 
                 if self.model.parallel_attn:
                     gradient += self.attn_backward(start_gradient, layer)
