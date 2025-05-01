@@ -2,7 +2,7 @@ window.initCgFeatureDetail = async function({visState, renderAll, data, cgSel}){
   var sel = cgSel.select('.feature-detail').html('')
   if (!sel.node()) return
 
-  // var headerSel = sel.append('div.feature-header')
+  var headerSel = sel.append('div.feature-header')
   var logitsSel = sel.append('div.logits-container')
   var examplesSel = sel.append('div.feature-examples-container')
   var featureExamples = await window.initFeatureExamples({
@@ -42,21 +42,21 @@ window.initCgFeatureDetail = async function({visState, renderAll, data, cgSel}){
       if (d.isError) addLogits(d)
       if (d.feature_type=='logit') addEmbeddings(d)
 
-      // headerSel.html('').append('div.header-top-row').append('div.feature-title')
-      //   .text(d.ppClerp)
+      headerSel.html('').append('div.header-top-row').append('div.feature-title')
+        .text(d.ppClerp)
       examplesSel.st({opacity: 0})
     } else if (d.feature_type == 'cross layer transcoder') {
       addLogits(d)
       addEmbeddings(d)
-      // var headerTopRowSel = headerSel.html('').append('div.header-top-row')
-      // headerTopRowSel.append('div.feature-title')
-      //   .html(`Feature&nbsp;<a style="color: inherit;" href="${d.url}" target="_blank">${label}</a>`)
+      var headerTopRowSel = headerSel.html('').append('div.header-top-row')
+      headerTopRowSel.append('div.feature-title')
+        .html(`Feature&nbsp;<a style="color: inherit;" href="${d.url}" target="_blank">${label}</a>`)
 
-      // headerTopRowSel.append('div.pp-clerp')
-      //   .text(d.ppClerp)
-      //   .at({title: d.ppClerp})
+      headerTopRowSel.append('div.pp-clerp')
+        .text(d.ppClerp)
+        .at({title: d.ppClerp})
 
-      if (visState.isEditMode && false){
+      if (visState.isEditMode){
         headerTopRowSel.append('button.edit-clerp-button')
           .text('Edit')
           .on('click', toggleEdit)
@@ -111,17 +111,17 @@ window.initCgFeatureDetail = async function({visState, renderAll, data, cgSel}){
     }
 
     // add pinned/click state and toggle to feature-title
-    // headerSel.select('div.feature-title')
-    //   .classed('pinned', d.nodeId && visState.pinnedIds.includes(d.nodeId))
-    //   .classed('hovered', visState.clickedId == d.nodeId)
-    //   .on('click', ev => {
-    //     utilCg.clickFeature(visState, renderAll, d, ev.metaKey || ev.ctrlKey)
+    headerSel.select('div.feature-title')
+      .classed('pinned', d.nodeId && visState.pinnedIds.includes(d.nodeId))
+      .classed('hovered', visState.clickedId == d.nodeId)
+      .on('click', ev => {
+        utilCg.clickFeature(visState, renderAll, d, ev.metaKey || ev.ctrlKey)
 
-    //     if (visState.clickedId) return
-    //     // double render to toggle on hoveredId, could expose more of utilCg.clickFeature to prevent
-    //     visState.hoveredId = d.featureId
-    //     renderAll.hoveredId()
-    //   })
+        if (visState.clickedId) return
+        // double render to toggle on hoveredId, could expose more of utilCg.clickFeature to prevent
+        visState.hoveredId = d.featureId
+        renderAll.hoveredId()
+      })
 
   }
 

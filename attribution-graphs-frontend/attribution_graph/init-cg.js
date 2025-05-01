@@ -59,7 +59,7 @@ window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isG
   }
   colorLinks()
 
-  renderAll.hClerpUpdate.fns.push(() => utilCg.hClerpUpdateFn(null, data))
+  renderAll.hClerpUpdate.fns.push((ev) => utilCg.hClerpUpdateFn(ev, data))
 
   renderAll.hoveredId.fns.push(() => {
     // use hovered node if possible, otherwise use last occurence of feature

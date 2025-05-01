@@ -123,7 +123,7 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
       .filter(d => d.memberNodes.length)
 
     // update clerps — fragile hack if hClerpUpdate changes
-    nodes.forEach(d => d.ppClerp = d.clerp)
+    // nodes.forEach(d => d.ppClerp = d.clerp)
     supernodes.forEach(({ppClerp, memberNodes}) => {
       if (memberNodes.length == 1 && ppClerp == memberNodes[0].ppClerp) return
 
@@ -383,7 +383,7 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
     }).map(([key, fn]) => ({key, fn}))
 
 
-    if (visState.isEditMode && false) {
+    if (visState.isEditMode) {
       div.append('div.checkbox-container').translate([-c.margin.left, c.margin.bottom])
         .appendMany('label', checkboxes).append('input')
         .at({type: 'checkbox'})
@@ -395,7 +395,13 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
         .parent().append('span').text(d => d.key)
     }
 
-    checkboxes.forEach(d => d.fn())
+    checkboxes.forEach(d => {
+      try {
+        d.fn()
+      } catch (e) {
+        console.error('Error in checkbox function', d.key, e)
+      }
+    })
 
     function unsticky(){
       selForceNodes.forEach(d => (d.fx = d.fy = null))
