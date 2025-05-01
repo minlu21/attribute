@@ -45,7 +45,10 @@ class AttributionConfig:
     node_threshold = 1e-3
     # keep per_layer_position nodes above this threshold for each layer/position pair
     secondary_threshold = 1e-5
-    per_layer_position = 2
+    per_layer_position = 0
+    # preserve all error/input nodes
+    keep_all_error_nodes: bool = False
+    keep_all_input_nodes: bool = True
 
     # correct for bias when saving top output logits
     use_logit_bias: bool = False
@@ -100,13 +103,30 @@ class AttributionGraph:
 
         logger.info("Finding adjacency matrix")
         logger.info(f"Number of nodes: {len(dedup_node_names)}")
+
         n_initial = len(dedup_node_names)
+        error_mask = np.zeros((n_initial,))
+        for i, node in enumerate(dedup_node_names):
+            node = self.nodes[node]
+            if isinstance(node, ErrorNode):
+                error_mask[i] = 1
+
         adj_matrix = np.zeros((n_initial, n_initial))
         for edge in self.edges.values():
             target_index = dedup_node_indices[edge.target.id]
             source_index = dedup_node_indices[edge.source.id]
             adj_matrix[target_index, source_index] = abs(edge.weight)
         adj_matrix /= np.maximum(1e-2, np.nan_to_num(adj_matrix.sum(axis=1, keepdims=True)))
+
+        logger.info("Finding influence sources")
+        influence_sources = np.zeros((n_initial,))
+        for index, node in enumerate(dedup_node_names):
+            node = self.nodes[node]
+            if isinstance(node, OutputNode):
+                influence_sources[index] = node.probability
+
+        total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
+        logger.info(f"Completeness score: {total_error_influence:.3f}")
 
         logger.info("Finding influence matrix")
         if not hasattr(self, "influence"):
@@ -116,19 +136,17 @@ class AttributionGraph:
         else:
             influence = self.influence
 
-        logger.info("Finding influence sources")
-        influence_sources = np.zeros((n_initial,))
-        for index, node in enumerate(dedup_node_names):
-            node = self.nodes[node]
-            if not isinstance(node, OutputNode):
-                continue
-            influence_sources[index] = node.probability
+        total_error_influence = 1 - (influence_sources @ influence) @ error_mask
+        logger.info(f"Replacement score: {total_error_influence:.3f}")
+
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
 
         logger.info("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
-                  if self.nodes[node].node_type in ("InputNode", "OutputNode", "ErrorNode")]
+                  if self.nodes[node].node_type in ("OutputNode",)
+                  + (("InputNode",) if self.config.keep_all_input_nodes else ())
+                  + (("ErrorNode",) if self.config.keep_all_error_nodes else ())]
         for seq_idx in range(self.cache.input_ids.shape[-1]):
             for layer_idx in range(self.model.num_layers):
                 matching_nodes = [
@@ -244,9 +262,11 @@ class AttributionGraph:
 
     async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
         module_latents = defaultdict(list)
+        dead_features = set()
         for node in self.exported_nodes:
             if node.node_type == "IntermediateNode":
                 layer, feature = int(node.layer_index), int(node.feature_index)
+                dead_features.add((layer, feature))
                 module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
 
@@ -264,6 +284,7 @@ class AttributionGraph:
         def process_feature(feature):
             layer_idx = int(feature.latent.module_name.split(".")[-2])
             feature_idx = feature.latent.latent_index
+            dead_features.discard((layer_idx, feature_idx))
             index = cantor(layer_idx, feature_idx)
 
             feature_dir = save_dir / "features" / self.config.scan
@@ -315,6 +336,9 @@ class AttributionGraph:
             process_feature(feature)
         bar.close()
 
+        if len(dead_features) > 0:
+            dead_features = list(dead_features)
+            logger.info(f"Dead features: {dead_features[:10]}{'...' if len(dead_features) > 10 else ''}")
 
     def initialize_graph(self):
         num_layers = self.num_layers

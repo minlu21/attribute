@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 MODEL=roneneldan/TinyStories-33M
 TRANSCODER=../e2e/checkpoints/clt-ts/ts
-DATASET="--dataset_repo roneneldan/TinyStories --dataset_split train --n_tokens 1_000_000"
+DATASET="--dataset_repo roneneldan/TinyStories --dataset_split train --n_tokens 10_000_000"
 CUDA_VISIBLE_DEVICES=7 python cache.py $MODEL $TRANSCODER --num_gpus 1 $DATASET --hookpoints h.0.mlp h.1.mlp h.2.mlp h.3.mlp --name transcoder_128x

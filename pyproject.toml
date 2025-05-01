@@ -26,6 +26,6 @@ eai-sparsify = { git = "https://github.com/EleutherAI/sparsify", branch="clt" }
 
 
 [tool.ruff]
-exclude = ["attribute/__main__.py", "attributor.py"]
+exclude = ["feature_vis.py"]
 # Ignore F722 for jaxtyping
 ignore = ["F722"]
