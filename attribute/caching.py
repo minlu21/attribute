@@ -317,6 +317,13 @@ class TranscodedModel(object):
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     @property
+    def logit_bias(self):
+        bias = self.model.lm_head.bias
+        if bias is None:
+            bias = 0
+        return bias + self.logit_weight @ self.final_ln.bias
+
+    @property
     def vocab_size(self):
         return self.model.config.vocab_size
 

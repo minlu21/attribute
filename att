@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
-uv run python -m attribute "<|endoftext|>Once upon a" \
+uv run python -m attribute \
 --model_name="roneneldan/TinyStories-33M" \
 --transcoder_path="../e2e/checkpoints/clt-ts/ts" --cache_path=results/transcoder_128x/latents \
+"<|endoftext|>Once upon a"
+# "<|endoftext|>Once upon a time, Ada was happily walking through a magical forest with"

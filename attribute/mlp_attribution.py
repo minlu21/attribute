@@ -47,6 +47,9 @@ class AttributionConfig:
     secondary_threshold = 1e-5
     per_layer_position = 2
 
+    # correct for bias when saving top output logits
+    use_logit_bias: bool = False
+
 
 class AttributionGraph:
     def __init__(
@@ -255,6 +258,7 @@ class AttributionGraph:
         )
 
         logit_weight = self.model.logit_weight
+        logit_bias = self.model.logit_bias
 
         bar = tqdm(total=sum(map(len, module_latents.values())))
         def process_feature(feature):
@@ -290,6 +294,8 @@ class AttributionGraph:
                 finally:
                     logger.enable("attribute.caching")
                 logits = logit_weight @ dec_weight
+                if self.config.use_logit_bias:
+                    logits += logit_bias
                 top_logits = logits.topk(10).indices.tolist()
                 bottom_logits = logits.topk(10, largest=False).indices.tolist()
             top_logits = [self.model.decode_token(i) for i in top_logits]
