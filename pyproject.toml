@@ -22,10 +22,11 @@ dependencies = [
 
 [tool.uv.sources]
 eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
-eai-sparsify = { git = "https://github.com/EleutherAI/sparsify", branch="clt" }
+eai-sparsify = { path = "../e2e", editable = true }
+# git = "https://github.com/EleutherAI/sparsify", branch="clt"
 
 
 [tool.ruff]
-exclude = ["feature_vis.py"]
+exclude = ["feature_vis.py", "accuracy.py"]
 # Ignore F722 for jaxtyping
 ignore = ["F722"]

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-uv run python -m attribute \
---model_name="roneneldan/TinyStories-33M" \
---transcoder_path="../e2e/checkpoints/clt-ts/ts" --cache_path=results/transcoder_128x/latents \
-"<|endoftext|>After falling in mud, she had a"
-# "<|endoftext|>She had a"
-# "<|endoftext|>Once upon a"
-# "<|endoftext|>Once upon a time, Ada was happily walking through a magical forest with"
+CUDA_VISIBLE_DEVICES=1 uv run python -m attribute --model_name="nev/acronym-toy-3M" \
+--transcoder_path="../e2e/checkpoints/acr-clt/test" \
+--cache_path=results/transcoder_acr/latents \
+--name "test-1-acr" \
+"National Done Automatic Graph ("
+exit
+ATT='uv run python -m attribute --model_name="roneneldan/TinyStories-33M" --transcoder_path="../e2e/checkpoints/clt-ts/ts" --cache_path=results/transcoder_128x/latents'
+# $ATT --name="test-1-ts" "<|endoftext|>After falling in mud, she had a"
+# $ATT --name="test-2-ts" "<|endoftext|>There was a girl called Lucy."
+$ATT --name="test-3-ts" "<|endoftext|>The girl's dog had a red ball. She said \"It's color is"
+$ATT --name="test-4-ts" "<|endoftext|>Once upon a time, Ada was happily walking through a magical forest with"

@@ -7,5 +7,6 @@ uv venv --seed
 uv sync
 uv run python -m attribute
 cd attribution-graphs-frontend
-uv run python -m http.server 9999 & ngrok http 9999
+uv run python serve.py 9999
+ngrok http 9999
 ```
