@@ -4,10 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import numpy as np
 from jaxtyping import Array, Float, Int
 from sparsify import SparseCoder
-from sparsify.utils import decoder_impl
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
@@ -130,7 +128,7 @@ class TranscodedModel(object):
             return 1
         return self.model.config.num_attention_heads // self.model.config.num_key_value_heads
 
-    def __call__(self, prompt: str, mask_features: dict[int, list[int]] = {}) -> TranscodedOutputs:
+    def __call__(self, prompt: str, mask_features: dict[int, list[int]] = {}, errors_from: TranscodedOutputs | None = None) -> TranscodedOutputs:
         tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         self.clear_hooks()
 
@@ -183,26 +181,23 @@ class TranscodedModel(object):
             input = input.view(-1, input.shape[-1])
             # have to normalize input
             transcoder_acts = transcoder(input)
+
+            layer_idx = self.name_to_index[module_name]
+            masked_features = mask_features.get(layer_idx, [])
+            if masked_features:
+                acts = transcoder_acts.latent_acts
+                indices = transcoder_acts.latent_indices
+                acts *= 1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float()
+
             transcoder_outputs[module_name] = transcoder_acts
 
             sae_out = 0
             to_delete = set()
-            subtract = output.new_zeros(np.prod(output.shape[:-1]), output.shape[-1])
             for k, v in transcoder_outputs.items():
-                layer_idx = self.name_to_index[k]
-                masked_features = mask_features.get(layer_idx, [])
-                if masked_features:
-                    acts = v.latent_acts
-                    indices = v.latent_indices
-                    acts = acts * torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float()
-                    decoded = decoder_impl(
-                        acts, indices, v.current_w_dec
-                    )
-                    subtract += decoded
-
+                divide_by = max(1, len(transcoder_outputs) - 1)
                 out = v(
                     None,
-                    addition=(0 if k != module_name else sae_out) / max(1, len(transcoder_outputs) - 1),
+                    addition=(0 if k != module_name else sae_out) / divide_by,
                 )
                 if k == module_name:
                     sae_out = out.sae_out
@@ -214,8 +209,13 @@ class TranscodedModel(object):
                 del transcoder_outputs[k]
             # have to reshape output to get the batch dimension back
             transcoder_out = sae_out.view(output.shape)
-            error = output - transcoder_out
-            logger.info(f"Layer {module_name} error: {error.norm() / output.norm()}")
+            diff = output - transcoder_out
+
+            if errors_from is None:
+                error = diff
+            else:
+                error = errors_from.mlp_outputs[layer_idx].error
+            logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
 
             transcoder_activations[module_name] = (
                 transcoder_acts.latent_acts.unflatten(0, batch_dims),
@@ -224,7 +224,7 @@ class TranscodedModel(object):
 
             errors[module_name] = error
 
-            return output - subtract.unflatten(0, batch_dims)
+            return (transcoder_out + error).to(output)
 
         for hookpoint in self.hookpoints_mlp:
             self.name_to_module[hookpoint].register_forward_hook(get_mlp_hook)

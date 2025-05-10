@@ -89,10 +89,7 @@ class AttributionGraph:
     def logits(self):
         return self.cache.logits[0]
 
-    def save_graph(self, save_dir: os.PathLike):
-        save_dir = Path(save_dir)
-        logger.info("Saving graph to", save_dir)
-
+    def adjacency_matrix(self, normalize: bool = True, absolute: bool = True, use_activation: bool = True):
         logger.info("Deduplicating nodes")
         dedup_node_names = set()
         for edge in self.edges.values():
@@ -105,18 +102,35 @@ class AttributionGraph:
         logger.info(f"Number of nodes: {len(dedup_node_names)}")
 
         n_initial = len(dedup_node_names)
+        adj_matrix = np.zeros((n_initial, n_initial))
+        for edge in self.edges.values():
+            target_index = dedup_node_indices[edge.target.id]
+            source_index = dedup_node_indices[edge.source.id]
+            weight = edge.weight
+            if not use_activation and isinstance(edge.source, IntermediateNode):
+                weight /= edge.source.activation
+            if absolute:
+                weight = abs(weight)
+            adj_matrix[target_index, source_index] = weight
+        if normalize:
+            adj_matrix /= np.maximum(1e-2, np.nan_to_num(adj_matrix.sum(axis=1, keepdims=True)))
+
+        return adj_matrix, dedup_node_names
+
+
+    def save_graph(self, save_dir: os.PathLike):
+        save_dir = Path(save_dir)
+        logger.info("Saving graph to", save_dir)
+
+        adj_matrix, dedup_node_names = self.adjacency_matrix()
+        dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
+
+        n_initial = len(dedup_node_names)
         error_mask = np.zeros((n_initial,))
         for i, node in enumerate(dedup_node_names):
             node = self.nodes[node]
             if isinstance(node, ErrorNode):
                 error_mask[i] = 1
-
-        adj_matrix = np.zeros((n_initial, n_initial))
-        for edge in self.edges.values():
-            target_index = dedup_node_indices[edge.target.id]
-            source_index = dedup_node_indices[edge.source.id]
-            adj_matrix[target_index, source_index] = abs(edge.weight)
-        adj_matrix /= np.maximum(1e-2, np.nan_to_num(adj_matrix.sum(axis=1, keepdims=True)))
 
         logger.info("Finding influence sources")
         influence_sources = np.zeros((n_initial,))
@@ -148,7 +162,7 @@ class AttributionGraph:
                   + (("InputNode",) if self.config.keep_all_input_nodes else ())
                   + (("ErrorNode",) if self.config.keep_all_error_nodes else ())]
         for seq_idx in range(self.cache.input_ids.shape[-1]):
-            for layer_idx in range(self.model.num_layers):
+            for layer_idx in range(self.num_layers):
                 matching_nodes = [
                     node for node in dedup_node_names
                     if self.nodes[node].layer_index == layer_idx
@@ -342,6 +356,7 @@ class AttributionGraph:
 
     def initialize_graph(self):
         num_layers = self.num_layers
+        logger.info(f"Initializing graph with {num_layers} layers")
         assert self.cache.batch_size == 1, "Batch size >1 not supported"
         input_ids = self.input_ids
         seq_len = self.seq_len
@@ -356,6 +371,7 @@ class AttributionGraph:
             input_node = InputNode(
                 id=f"input_{i}",
                 token_position=i,
+                token_idx=input_ids[i],
                 token_str=self.tokenizer.decode([input_ids[i]]),
                 output_vector=embedding.to(dtype=torch.bfloat16),
                 layer_index=-1,
@@ -436,6 +452,7 @@ class AttributionGraph:
             output_node = OutputNode(
                 id=f"output_{seq_len-1}_{i}",
                 token_position=seq_len - 1,
+                token_idx=top_10_indices[i],
                 token_str=self.tokenizer.decode([top_10_indices[i]]),
                 probability=top_10_probabilities[i].item(),
                 logit=self.logits[-1, top_10_indices[i]].item(),
@@ -673,8 +690,8 @@ class AttributionGraph:
                     new_contribution = all_contributions[n_path]
                     new_source = new_contribution.source
                     weight = new_contribution.contribution
-                    if isinstance(new_source, IntermediateNode):
-                        weight *= new_source.activation
+                    # if isinstance(new_source, IntermediateNode):
+                    #     weight *= new_source.activation
                     edge = Edge(
                         source=new_source,
                         target=target_node,

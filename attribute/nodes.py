@@ -65,6 +65,7 @@ class Contribution:
 @dataclass
 class OutputNode(Node):
     token_str: str
+    token_idx: int
     probability: float
     logit: float
     input_vector: Tensor
@@ -73,6 +74,7 @@ class OutputNode(Node):
 @dataclass
 class InputNode(Node):
     token_str: str
+    token_idx: int
     output_vector: Tensor
 
 
