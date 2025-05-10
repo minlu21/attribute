@@ -123,7 +123,7 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
       .filter(d => d.memberNodes.length)
 
     // update clerps — fragile hack if hClerpUpdate changes
-    nodes.forEach(d => d.ppClerp = d.clerp)
+    // nodes.forEach(d => d.ppClerp = d.clerp)
     supernodes.forEach(({ppClerp, memberNodes}) => {
       if (memberNodes.length == 1 && ppClerp == memberNodes[0].ppClerp) return
 

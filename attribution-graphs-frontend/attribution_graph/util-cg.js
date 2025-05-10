@@ -105,7 +105,11 @@ window.utilCg = (function(){
       var feature = data.features.idToFeature[node.featureId]
       if (!feature) return
       node.localClerp = feature.localClerp
-      node.ppClerp = feature.ppClerp
+      if (feature.feature_type == 'cross layer transcoder') {
+        node.ppClerp = feature.ppClerp
+      } else {
+        node.ppClerp = node.localClerp || node.remoteClerp || node.clerp;
+      }
     })
   }
 
