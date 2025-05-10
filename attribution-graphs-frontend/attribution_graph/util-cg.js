@@ -259,7 +259,14 @@ window.utilCg = (function(){
         d.streamIdx = streamIdx
         d.layerLocationLabel = layerLocationLabel(d.layer, d.probe_location_idx)
 
-        if (!visState.isHideLayer) d.streamIdx = isFinite(d.layer) ? +d.layer : 0
+        if (!visState.isHideLayer) {
+          d.streamIdx = isFinite(d.layer) ? +d.layer : 0
+          // if (d.layer == "E") {
+          //   d.streamIdx = 0;
+          // } else {
+          //   d.streamIdx = 1 + d.streamIdx;
+          // }
+        }
       })
     })
 

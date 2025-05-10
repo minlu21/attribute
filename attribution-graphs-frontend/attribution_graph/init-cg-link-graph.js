@@ -86,10 +86,14 @@ window.initCgLinkGraph = function({visState, renderAll, data, cgSel}){
       d.yOffset = 0
     })
   })
-  nodes.forEach(d => d.pos = [
-    c.x(d.ctx_idx) + d.xOffset,
-    c.y(d.streamIdx) + c.y.bandwidth()/2 + d.yOffset
-  ])
+  nodes.forEach(d => {
+    const streamIdx = d.layer == "E" ? 0 : 1 + d.streamIdx;
+    // const streamIdx = d.streamIdx;
+    d.pos = [
+      c.x(d.ctx_idx) + d.xOffset,
+      c.y(streamIdx) + c.y.bandwidth()/2 + d.yOffset
+    ]
+  })
   const filt = nodes.filter(d => d.pos.some(x => !isFinite(x)))
   // console.log("nodes", filt)
   filt.forEach(d => console.log([
