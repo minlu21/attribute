@@ -34,6 +34,7 @@ graph = AttributionGraph(model, og_activations, config)
 graph.flow()
 #%%
 adj_matrix, dedup_node_names = graph.adjacency_matrix(normalize=False, absolute=False)
+# adj_matrix, dedup_node_names = graph.adjacency_matrix(normalize=False, absolute=True)
 dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
 #%%
 identity = np.eye(len(dedup_node_names))
@@ -75,7 +76,7 @@ dist_act_large = []
 dist_act_small = []
 N_EXPERIMENTS = 4
 N_SAMPLES = 100
-seed = 4
+seed = 5
 torch.manual_seed(seed)
 random.seed(seed)
 np.random.seed(seed)
@@ -83,6 +84,9 @@ for sample_idx in range(N_SAMPLES + N_EXPERIMENTS):
     remove_n = 4
     if sample_idx >= N_EXPERIMENTS:
         sample_removed = {k: random.sample(v, remove_n) for k, v in per_layer.items()}
+        if sample_idx == N_SAMPLES + N_EXPERIMENTS - 1 and False:
+            to_leave = random.choice(list(sample_removed.keys()))
+            sample_removed = {k: (v if k == to_leave else []) for k, v in sample_removed.items()}
     elif sample_idx in (0, 1):
         sample_removed = {k: [] for k in per_layer}
         for k in per_layer:
@@ -170,8 +174,6 @@ plt.hist(dist_kl_large, bins=bins, alpha=0.5, label="kl large")
 plt.hist(dist_act_small, bins=bins, alpha=0.5, label="act small")
 plt.hist(dist_act_large, bins=bins, alpha=0.5, label="act large")
 plt.legend()
-#%%
-dist_act_small
 # %%
 masked_values = collect_values(masked_activations)
 xs = []
@@ -182,20 +184,28 @@ for k, v in og_values.items():
     if node_index not in dedup_node_names:
         continue
     inf_estimate = inf_matrix[dedup_node_indices[node_index]] @ (-removed_mask)
+    # inf_estimate = np.abs(inf_matrix[dedup_node_indices[node_index]]) @ removed_mask
     # inf_estimate = adj_matrix[dedup_node_indices[node_index]] @ (-removed_mask)
+    rel_estimate = abs(inf_estimate) / v
+
     if k in masked_values:
         difference = masked_values[k] - v
-        xs.append(difference)
-        ys.append(inf_estimate)
+        rel = abs(difference) / v
+        xs.append(rel)
+        ys.append(rel_estimate)
         if inf_estimate == 0:
             print(k)
 
+xs = np.array(xs)
+ys = np.array(ys)
 plt.scatter(xs, ys, s=1)
-plt.xlim(-1, 1)
-plt.ylim(-1, 1)
+# plt.xlim(-1, 1)
+# plt.ylim(-1, 1)
+plt.xlabel("Relative difference")
+plt.xlabel("Relative difference estimate")
 mask = ys != 0
-xs = np.array(xs)[mask][0]
-ys = np.array(ys)[mask][0]
+xs = xs[mask]
+ys = ys[mask]
 spearman_corr = spearmanr(xs, ys, nan_policy="omit").correlation
 plt.title(f"Spearman correlation (nonzero): {spearman_corr}")
 plt.show()
