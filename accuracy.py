@@ -202,7 +202,7 @@ plt.scatter(xs, ys, s=1)
 # plt.xlim(-1, 1)
 # plt.ylim(-1, 1)
 plt.xlabel("Relative difference")
-plt.xlabel("Relative difference estimate")
+plt.ylabel("Relative difference estimate")
 mask = ys != 0
 xs = xs[mask]
 ys = ys[mask]

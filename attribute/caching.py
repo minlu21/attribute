@@ -194,7 +194,8 @@ class TranscodedModel(object):
             sae_out = 0
             to_delete = set()
             for k, v in transcoder_outputs.items():
-                divide_by = max(1, len(transcoder_outputs) - 1)
+                # divide_by = max(1, len(transcoder_outputs) - 1)
+                divide_by = 1
                 out = v(
                     None,
                     addition=(0 if k != module_name else sae_out) / divide_by,

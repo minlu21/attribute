@@ -3,7 +3,8 @@ CUDA_VISIBLE_DEVICES=1 uv run python -m attribute --model_name="nev/acronym-toy-
 --transcoder_path="../e2e/checkpoints/acr-clt/test" \
 --cache_path=results/transcoder_acr/latents \
 --name "test-1-acr" \
-"National Done Automatic Graph ("
+--scan "acr-new-test" \
+"National Dome Automatic Graph ("
 exit
 ATT='uv run python -m attribute --model_name="roneneldan/TinyStories-33M" --transcoder_path="../e2e/checkpoints/clt-ts/ts" --cache_path=results/transcoder_128x/latents'
 # $ATT --name="test-1-ts" "<|endoftext|>After falling in mud, she had a"

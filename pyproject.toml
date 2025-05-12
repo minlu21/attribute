@@ -23,8 +23,8 @@ dependencies = [
 
 [tool.uv.sources]
 eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
-eai-sparsify = { path = "../e2e", editable = true }
-# git = "https://github.com/EleutherAI/sparsify", branch="clt"
+# eai-sparsify = { path = "../e2e", editable = true }
+eai-sparsify = { git = "https://github.com/EleutherAI/sparsify", branch="clt" }
 
 
 [tool.ruff]
