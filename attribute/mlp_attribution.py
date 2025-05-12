@@ -35,14 +35,14 @@ class AttributionConfig:
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
 
     # remove MLP edges below this threshold
-    pre_filter_threshold: float = 1e-4
+    pre_filter_threshold: float = 1e-5
     # keep edges above this threshold
-    edge_threshold = 1e-4
+    edge_threshold = 1e-5
     # keep top k edges for each node
     top_k_edges: int = 256
 
     # always keep nodes above this threshold of influence
-    node_threshold = 1e-3
+    node_threshold = 1e-4
     # keep per_layer_position nodes above this threshold for each layer/position pair
     secondary_threshold = 1e-5
     per_layer_position = 0

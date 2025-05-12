@@ -16,6 +16,7 @@ async def main(
     cache_path = "/mnt/ssd-1/gpaulo/smollm-decomposition/attribution_graph/results/transcoder_128x/latents",
     name = "test-1-ts",
     scan = "default",
+    remove_bos = False,
 ):
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -30,6 +31,26 @@ async def main(
         device="cuda",
     )
     transcoded_outputs = model(prompt)
+
+    if remove_bos:
+        transcoded_outputs.input_ids = transcoded_outputs.input_ids[:, 1:]
+        # only ever accessed w/ [-1], removing BOS doesn't matter
+        # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
+        transcoded_outputs.logits = transcoded_outputs.logits[:, 1:]
+        transcoded_outputs.pre_final_ln = transcoded_outputs.pre_final_ln[:, 1:]
+        transcoded_outputs.final_ln = transcoded_outputs.final_ln[:, 1:]
+        for k, mlp_output in transcoded_outputs.mlp_outputs.items():
+            mlp_output.pre_second_ln = mlp_output.pre_second_ln[:, 1:]
+            mlp_output.second_ln = mlp_output.second_ln[:, 1:]
+            mlp_output.activation = mlp_output.activation[:, 1:]
+            mlp_output.location = mlp_output.location[:, 1:]
+            mlp_output.error = mlp_output.error[:, 1:]
+        for k, attn_output in transcoded_outputs.attn_outputs.items():
+            attn_output.pre_first_ln = attn_output.pre_first_ln[:, 1:]
+            attn_output.first_ln = attn_output.first_ln[:, 1:]
+            attn_output.attn_values = attn_output.attn_values[:, :, 1:]
+            attn_output.attn_patterns = attn_output.attn_patterns[:, :, 1:, 1:]
+
     attribution_graph = AttributionGraph(model, transcoded_outputs, config)
     attribution_graph.flow()
     attribution_graph.save_graph(save_dir)

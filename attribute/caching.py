@@ -9,9 +9,13 @@ from sparsify import SparseCoder
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
+from transformers.models.gpt2 import GPT2PreTrainedModel
 from loguru import logger
 
 from .utils import repeat_kv
+
+
+GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 
 
 @dataclass
@@ -84,7 +88,7 @@ class TranscodedModel(object):
             def hookpoint_fn(hookpoint):
                 if isinstance(model, LlamaPreTrainedModel):
                     return hookpoint.replace("model.layers.", "layers.")
-                elif isinstance(model, GPTNeoPreTrainedModel):
+                elif isinstance(model, GPT2Like):
                     return hookpoint.replace("transformer.h.", "h.")
                 else:
                     logger.warning(f"Unknown model type: {type(model)}. Using default hookpoint.")
@@ -149,7 +153,7 @@ class TranscodedModel(object):
             hidden_shape = (*input_shape, -1, self.head_dim)
 
             layer_idx = self.name_to_index[layer_name]
-            value_states = self.attn(layer_idx).v_proj(layer_normed).view(hidden_shape).transpose(1, 2)
+            value_states = self.project_v(layer_idx, layer_normed).view(hidden_shape).transpose(1, 2)
             values = repeat_kv(value_states, self.repeat_kv)
             attn_values[layer_name] = values
 
@@ -280,7 +284,7 @@ class TranscodedModel(object):
     def layer_prefix(self):
         if isinstance(self.model, LlamaPreTrainedModel):
             return "model.layers"
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, GPT2Like):
             return "transformer.h"
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
@@ -289,7 +293,7 @@ class TranscodedModel(object):
     def attn_layernorm_name(self):
         if isinstance(self.model, LlamaPreTrainedModel):
             return "input_layernorm"
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, GPT2Like):
             return "ln_1"
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
@@ -298,7 +302,7 @@ class TranscodedModel(object):
     def mlp_layernorm_name(self):
         if isinstance(self.model, LlamaPreTrainedModel):
             return "post_attention_layernorm"
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, GPT2Like):
             return "ln_2"
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
@@ -307,20 +311,20 @@ class TranscodedModel(object):
     def embedding_weight(self):
         if isinstance(self.model, LlamaPreTrainedModel):
             return self.model.model.embed_tokens.weight
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, GPT2Like):
             return self.model.transformer.wte.weight
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     @property
     def parallel_attn(self):
-        return isinstance(self.model, GPTNeoPreTrainedModel)
+        return isinstance(self.model, GPT2Like)
 
     @property
     def final_ln(self):
         if isinstance(self.model, LlamaPreTrainedModel):
             return self.model.model.norm
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, GPT2Like):
             return self.model.transformer.ln_f
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
@@ -329,7 +333,7 @@ class TranscodedModel(object):
     def logit_weight(self):
         if isinstance(self.model, LlamaPreTrainedModel):
             return self.model.lm_head.weight * self.final_ln.weight
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, GPT2Like):
             return self.model.lm_head.weight * self.final_ln.weight
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
@@ -401,6 +405,8 @@ class TranscodedModel(object):
             return layer.self_attn
         elif isinstance(self.model, GPTNeoPreTrainedModel):
             return layer.attn.attention
+        elif isinstance(self.model, GPT2PreTrainedModel):
+            return layer.attn
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
@@ -409,14 +415,28 @@ class TranscodedModel(object):
             w_o = self.attn(layer_idx).o_proj.weight
         elif isinstance(self.model, GPTNeoPreTrainedModel):
             w_o = self.attn(layer_idx).out_proj.weight
+        elif isinstance(self.model, GPT2PreTrainedModel):
+            w_o = self.attn(layer_idx).c_proj.weight.T
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
         return w_o.reshape(self.hidden_size, self.num_attention_heads, self.head_dim)
 
     def attn_value(self, layer_idx: int) -> Float[Array, "num_attention_heads head_dim hidden_size"]:
-        w_v = self.attn(layer_idx).v_proj.weight
+        if not isinstance(self.model, GPT2PreTrainedModel):
+            w_v = self.attn(layer_idx).v_proj.weight
+        else:
+            w_q, w_k, w_v = torch.split(self.attn(layer_idx).c_attn.weight, self.hidden_size, dim=1)
+            w_v = w_v.T
         w_v = torch.repeat_interleave(w_v, self.repeat_kv, dim=0)
         return w_v.reshape(self.num_attention_heads, self.head_dim, self.hidden_size)
+
+    def project_v(self, layer_idx: int, layer_normed: Float[Array, "batch seq_len hidden_size"]) -> Float[Array, "batch seq_len num_attention_heads head_dim"]:
+        if not isinstance(self.model, GPT2PreTrainedModel):
+            return self.attn(layer_idx).v_proj(layer_normed)
+        else:
+            projected = self.attn(layer_idx).c_attn(layer_normed)
+            q, k, v = torch.split(projected, self.hidden_size, dim=-1)
+            return v
 
     def decode_token(self, token_id: int) -> str:
         return self.tokenizer.decode([token_id])
