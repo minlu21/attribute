@@ -1,6 +1,7 @@
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -10,6 +11,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
 from transformers.models.gpt2 import GPT2PreTrainedModel
+from transformers.models.gpt2.modeling_gpt2 import eager_attention_forward as gpt2_eager_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from loguru import logger
 
 from .utils import repeat_kv
@@ -23,6 +26,7 @@ class MLPOutputs:
     pre_second_ln: Float[Array, "batch seq_len hidden_size"]
     second_ln: Float[Array, "batch seq_len hidden_size"]
     activation: Float[Array, "batch seq_len k"]
+    source_activation: Float[Array, "batch seq_len k"]
     location: Int[Array, "batch seq_len k"]
     error: Float[Array, "batch seq_len hidden_size"]
 
@@ -79,7 +83,7 @@ class TranscodedModel(object):
             model_name,
             device_map={"": device},
             torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
+            attn_implementation="eager",
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = model
@@ -162,6 +166,38 @@ class TranscodedModel(object):
         for hookpoint in self.hookpoints_layer:
             self.name_to_module[hookpoint].register_forward_hook(get_attention_values_hook)
 
+            attn = self.attn(self.name_to_index[hookpoint])
+            original_implementation = attn.config._attn_implementation
+            if original_implementation.startswith("no_grad_"):
+                continue
+            impl_name = original_implementation
+            if impl_name == "eager":
+                impl_name = f"eager_{type(attn).__name__}"
+            no_grad_name = "no_grad_" + impl_name
+            if no_grad_name not in ALL_ATTENTION_FUNCTIONS:
+                @torch.compile
+                def new_attention_forward(module, query, key, value, attention_mask, *, impl_fn, **kwargs):
+                    query = query.detach()
+                    key = key.detach()
+                    _, attn_weights = impl_fn(module, query, key, value, attention_mask, **kwargs)
+                    attn_weights = attn_weights.detach()
+
+                    attn_output = torch.matmul(attn_weights, value)
+                    attn_output = attn_output.transpose(1, 2)
+
+                    return attn_output, attn_weights
+                if isinstance(self.model, GPT2PreTrainedModel):
+                    eager_attention_forward = gpt2_eager_attention_forward
+                else:
+                    raise ValueError(f"Unsupported model type: {type(self.model)}")
+                ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
+                    new_attention_forward,
+                    impl_fn=
+                    ALL_ATTENTION_FUNCTIONS[original_implementation]
+                    if original_implementation != "eager"
+                    else eager_attention_forward)
+            attn.config._attn_implementation = no_grad_name
+
         second_ln = {}
         pre_second_ln = {}
 
@@ -169,11 +205,25 @@ class TranscodedModel(object):
             pre_second_ln[self.module_to_name[module]] = input[0]
             second_ln[self.module_to_name[module]] = output
 
+        @torch.compile
+        def ln_freeze_hook(module, input, output):
+            mean = input[0].mean(dim=-1, keepdim=True).detach()
+            var = input[0].var(dim=-1, keepdim=True).detach()
+            normalized = (input[0] - mean) / torch.sqrt(var + module.eps)
+            return normalized * module.weight + module.bias
+
         for hookpoint in self.hookpoints_ln:
             self.name_to_module[hookpoint].register_forward_hook(get_ln2_hook)
+            self.name_to_module[hookpoint].register_forward_hook(ln_freeze_hook)
+
+        for hookpoint in self.hookpoints_layer:
+            getattr(self.name_to_module[hookpoint], self.attn_layernorm_name).register_forward_hook(ln_freeze_hook)
+
 
         transcoder_outputs = {}
-        transcoder_activations = {}
+        target_transcoder_activations = {}
+        source_transcoder_activations = {}
+        transcoder_locations = {}
         errors = {}
 
         def get_mlp_hook(module, input, output):
@@ -187,6 +237,14 @@ class TranscodedModel(object):
             input = input.view(-1, input.shape[-1])
             # have to normalize input
             transcoder_acts = transcoder(input)
+
+            target_latent_acts = transcoder_acts.latent_acts.clone().unflatten(0, batch_dims)
+            source_latent_acts = transcoder_acts.latent_acts
+            source_latent_acts = source_latent_acts.unflatten(0, batch_dims).clone()
+            source_latent_acts.detach_()
+            source_latent_acts.requires_grad_(True)
+            flat_source_acts = source_latent_acts.flatten(0, -2)
+            transcoder_acts.latent_acts = flat_source_acts
 
             layer_idx = self.name_to_index[module_name]
             masked_features = mask_features.get(layer_idx, [])
@@ -222,12 +280,13 @@ class TranscodedModel(object):
                 error = diff
             else:
                 error = errors_from.mlp_outputs[layer_idx].error
+            error.detach_().requires_grad_(True)
             logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
 
-            transcoder_activations[module_name] = (
-                transcoder_acts.latent_acts.unflatten(0, batch_dims),
-                transcoder_acts.latent_indices.unflatten(0, batch_dims),
-            )
+            latent_indices = transcoder_acts.latent_indices.unflatten(0, batch_dims)
+            target_transcoder_activations[module_name] = target_latent_acts
+            source_transcoder_activations[module_name] = source_latent_acts
+            transcoder_locations[module_name] = latent_indices
 
             errors[module_name] = error
 
@@ -264,8 +323,9 @@ class TranscodedModel(object):
             mlp_outputs[i] = MLPOutputs(
                 pre_second_ln=pre_second_ln[self.hookpoints_ln[i]],
                 second_ln=second_ln[self.hookpoints_ln[i]],
-                activation=transcoder_activations[self.hookpoints_mlp[i]][0],
-                location=transcoder_activations[self.hookpoints_mlp[i]][1],
+                activation=target_transcoder_activations[self.hookpoints_mlp[i]],
+                source_activation=source_transcoder_activations[self.hookpoints_mlp[i]],
+                location=transcoder_locations[self.hookpoints_mlp[i]],
                 error=errors[self.hookpoints_mlp[i]],
             )
         attn_outputs = {}
