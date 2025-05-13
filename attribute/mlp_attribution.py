@@ -627,9 +627,10 @@ class AttributionGraph:
                 disable=True,
             ):
                 start_gradient = gradient.clone()
-                # pass skip gradient (just after the MLP) to the previous layer
-                past_gradients[layer] = start_gradient
                 if layer != max_layer:
+                    # pass skip gradient (just after the MLP) to the previous layer
+                    past_gradients[layer] = start_gradient
+
                     # find MLP sources on the current layer
                     mlp_contributions = self.mlp_contribution(gradient, layer)
                     for k, v in mlp_contributions.items():

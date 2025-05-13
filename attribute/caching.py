@@ -390,13 +390,14 @@ class TranscodedModel(object):
                 raise IndexError
 
     def w_skip(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "hidden_size hidden_size"]:
+        transcoder = self.transcoders[self.hookpoints_mlp[layer_idx]]
         try:
-            self.hookpoints_mlp[layer_idx].W_skip
+            transcoder.W_skip
         except AttributeError:
             assert target_layer_idx is not None, "target_layer_idx must be provided for multi-target transcoders"
             assert target_layer_idx >= layer_idx
             try:
-                w_skip = self.transcoders[self.hookpoints_mlp[layer_idx]].W_skips[target_layer_idx - layer_idx]
+                w_skip = transcoder.W_skips[target_layer_idx - layer_idx]
             except AttributeError:
                 raise IndexError
             if w_skip is None:
@@ -405,7 +406,7 @@ class TranscodedModel(object):
         else:
             if target_layer_idx != layer_idx:
                 raise IndexError
-            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_skip
+            return transcoder.W_skip
 
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
         return self.transcoders[self.hookpoints_mlp[layer_idx]].encoder.weight

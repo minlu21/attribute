@@ -18,6 +18,7 @@ import numpy as np
 # transcoder_path = "../e2e/checkpoints/clt-ts/test"
 model_name = "nev/GELU_4L512W_C4_Code"
 transcoder_path = "../e2e/checkpoints/gelu-4l-clt/k64"
+# transcoder_path = "../e2e/checkpoints/gelu-4l-nonclt-skip/baseline"
 # transcoder_path = "../e2e/checkpoints/gelu-4l-clt-noskip/baseline"
 # transcoder_path = "../e2e/checkpoints/gelu-4l-nonclt/baseline"
 
@@ -52,6 +53,8 @@ for _ in range(1024):
         if a_s > b_s:
             continue
         if a_l > b_l:
+            continue
+        if b_l - a_l != 2:
             continue
         source, target = a, b
         source_index, target_index = dedup_node_names.index(source), dedup_node_names.index(target)
