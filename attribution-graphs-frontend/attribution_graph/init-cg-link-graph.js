@@ -82,15 +82,25 @@ window.initCgLinkGraph = function({visState, renderAll, data, cgSel}){
     // ctxLayer = d3.sort(ctxLayer, d => visState.pinnedIds.includes(d.nodeId) ? -1 : 1)
     ctxLayer = d3.sort(ctxLayer, d => -d.logitPct)
     ctxLayer.forEach((d, i) => {
-      d.xOffset = d.feature_type === 'logit' ? ctxWidth - (padR/2 + i*s) : ctxWidth - (padR/2 + i*s)
+      // d.xOffset = d.feature_type === 'logit' ?
+        // ctxWidth - (padR/2 + i*s)
+        // : ctxWidth - (padR/2 + i*s)
+      if (d.feature_type === 'logit') {
+        d.xOffset = ctxWidth - (padR/2 + i*s)
+      } else if (d.feature_type === 'embedding') {
+        d.xOffset = ctxWidth - padR / 2
+      } else {
+        d.xOffset = ctxWidth - (padR/2 + i*s)
+      }
       d.yOffset = 0
     })
   })
   nodes.forEach(d => {
     const streamIdx = d.layer == "E" ? 0 : 1 + d.streamIdx;
     // const streamIdx = d.streamIdx;
+    const xOffset = d.xOffset;
     d.pos = [
-      c.x(d.ctx_idx) + d.xOffset,
+      c.x(d.ctx_idx) + xOffset,
       c.y(streamIdx) + c.y.bandwidth()/2 + d.yOffset
     ]
   })
