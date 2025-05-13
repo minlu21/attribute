@@ -37,17 +37,13 @@ async def main(
         # only ever accessed w/ [-1], removing BOS doesn't matter
         # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
         transcoded_outputs.logits = transcoded_outputs.logits[:, 1:]
-        transcoded_outputs.pre_final_ln = transcoded_outputs.pre_final_ln[:, 1:]
-        transcoded_outputs.final_ln = transcoded_outputs.final_ln[:, 1:]
         for k, mlp_output in transcoded_outputs.mlp_outputs.items():
-            mlp_output.pre_second_ln = mlp_output.pre_second_ln[:, 1:]
-            mlp_output.second_ln = mlp_output.second_ln[:, 1:]
+            mlp_output.ln_factor = mlp_output.ln_factor[:, 1:]
             mlp_output.activation = mlp_output.activation[:, 1:]
             mlp_output.location = mlp_output.location[:, 1:]
             mlp_output.error = mlp_output.error[:, 1:]
         for k, attn_output in transcoded_outputs.attn_outputs.items():
-            attn_output.pre_first_ln = attn_output.pre_first_ln[:, 1:]
-            attn_output.first_ln = attn_output.first_ln[:, 1:]
+            attn_output.ln_factor = attn_output.ln_factor[:, 1:]
             attn_output.attn_values = attn_output.attn_values[:, :, 1:]
             attn_output.attn_patterns = attn_output.attn_patterns[:, :, 1:, 1:]
 

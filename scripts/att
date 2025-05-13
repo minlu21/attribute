@@ -3,9 +3,9 @@ CUDA_VISIBLE_DEVICES=1 uv run python -m attribute --model_name="nev/GELU_4L512W_
 --transcoder_path="../e2e/checkpoints/gelu-4l-clt/k64" \
 --cache_path=results/transcoder_gelu4l/latents \
 --name "test-1-gelu4l" \
---scan "gelu-4l-k64-v0" \
+--scan "gelu-4l-k64-v1" \
 --remove_bos True \
-"<|BOS|>National Data Attribution Graph ("
+"<|BOS|>The National Digital Analytics Group ("
 exit
 
 CUDA_VISIBLE_DEVICES=1 uv run python -m attribute --model_name="nev/acronym-toy-3M" \

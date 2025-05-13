@@ -194,7 +194,8 @@ class TranscodedModel(object):
             if masked_features:
                 acts = transcoder_acts.latent_acts
                 indices = transcoder_acts.latent_indices
-                acts *= 1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float()
+                # TODO: when patching, we can't use automatic attribution
+                transcoder_acts.latent_acts = acts * (1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float())
 
             transcoder_outputs[module_name] = transcoder_acts
 
