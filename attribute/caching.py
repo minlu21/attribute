@@ -157,38 +157,7 @@ class TranscodedModel(object):
             self.name_to_module[hookpoint].register_forward_hook(get_attention_values_hook)
             ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
             ln.register_forward_hook(partial(ln_record_hook, save_dict=first_ln))
-
-            attn = self.attn(self.name_to_index[hookpoint])
-            original_implementation = attn.config._attn_implementation
-            if original_implementation.startswith("no_grad_"):
-                continue
-            impl_name = original_implementation
-            if impl_name == "eager":
-                impl_name = f"eager_{type(attn).__name__}"
-            no_grad_name = "no_grad_" + impl_name
-            if no_grad_name not in ALL_ATTENTION_FUNCTIONS:
-                @torch.compile
-                def new_attention_forward(module, query, key, value, attention_mask, *, impl_fn, **kwargs):
-                    query = query.detach()
-                    key = key.detach()
-                    _, attn_weights = impl_fn(module, query, key, value, attention_mask, **kwargs)
-                    attn_weights = attn_weights.detach()
-
-                    attn_output = torch.matmul(attn_weights, value)
-                    attn_output = attn_output.transpose(1, 2)
-
-                    return attn_output.detach(), attn_weights
-                if isinstance(self.model, GPT2PreTrainedModel):
-                    eager_attention_forward = gpt2_eager_attention_forward
-                else:
-                    raise ValueError(f"Unsupported model type: {type(self.model)}")
-                ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
-                    new_attention_forward,
-                    impl_fn=
-                    ALL_ATTENTION_FUNCTIONS[original_implementation]
-                    if original_implementation != "eager"
-                    else eager_attention_forward)
-            attn.config._attn_implementation = no_grad_name
+            self.freeze_attention_pattern(hookpoint)
 
         second_ln = {}
         for hookpoint in self.hookpoints_ln:
@@ -475,3 +444,36 @@ class TranscodedModel(object):
 
     def decode_token(self, token_id: int) -> str:
         return self.tokenizer.decode([token_id])
+
+    def freeze_attention_pattern(self, hookpoint: str):
+        attn = self.attn(self.name_to_index[hookpoint])
+        original_implementation = attn.config._attn_implementation
+        if original_implementation.startswith("no_grad_"):
+            return
+        impl_name = original_implementation
+        if impl_name == "eager":
+            impl_name = f"eager_{type(attn).__name__}"
+        no_grad_name = "no_grad_" + impl_name
+        if no_grad_name not in ALL_ATTENTION_FUNCTIONS:
+            @torch.compile
+            def new_attention_forward(module, query, key, value, attention_mask, *, impl_fn, **kwargs):
+                query = query.detach()
+                key = key.detach()
+                _, attn_weights = impl_fn(module, query, key, value, attention_mask, **kwargs)
+                attn_weights = attn_weights.detach()
+
+                attn_output = torch.matmul(attn_weights, value)
+                attn_output = attn_output.transpose(1, 2)
+
+                return attn_output, attn_weights
+            if isinstance(self.model, GPT2PreTrainedModel):
+                eager_attention_forward = gpt2_eager_attention_forward
+            else:
+                raise ValueError(f"Unsupported model type: {type(self.model)}")
+            ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
+                new_attention_forward,
+                impl_fn=
+                ALL_ATTENTION_FUNCTIONS[original_implementation]
+                if original_implementation != "eager"
+                else eager_attention_forward)
+        attn.config._attn_implementation = no_grad_name

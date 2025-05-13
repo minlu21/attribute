@@ -572,7 +572,7 @@ class AttributionGraph:
         )
         attn_pre_proj_gradient = attn_pre_proj_gradient * self.cache.attn_outputs[layer_index].ln_factor
 
-        return attn_pre_proj_gradient * 0
+        return attn_pre_proj_gradient
 
     @torch.no_grad()
     @torch.autocast("cuda")

@@ -17,8 +17,8 @@ import numpy as np
 # model_name = "roneneldan/TinyStories-33M"
 # transcoder_path = "../e2e/checkpoints/clt-ts/test"
 model_name = "nev/GELU_4L512W_C4_Code"
-# transcoder_path = "../e2e/checkpoints/gelu-4l-clt/k64"
-transcoder_path = "../e2e/checkpoints/gelu-4l-nonclt/baseline"
+transcoder_path = "../e2e/checkpoints/gelu-4l-clt/k64"
+# transcoder_path = "../e2e/checkpoints/gelu-4l-nonclt/baseline"
 
 model = TranscodedModel(
     model_name=model_name,
@@ -51,10 +51,6 @@ for _ in range(1024):
         if a_s > b_s:
             continue
         if a_l > b_l:
-            continue
-        if a_s != b_s:
-            continue
-        if a_l + 1 != b_l:
             continue
         source, target = a, b
         source_index, target_index = dedup_node_names.index(source), dedup_node_names.index(target)
