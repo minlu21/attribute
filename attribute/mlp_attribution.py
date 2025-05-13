@@ -42,7 +42,7 @@ class AttributionConfig:
     top_k_edges: int = 128
 
     # always keep nodes above this threshold of influence
-    node_threshold = 3e-3
+    node_threshold = 1e-3
     # keep per_layer_position nodes above this threshold for each layer/position pair
     secondary_threshold = 1e-5
     per_layer_position = 0
@@ -138,9 +138,11 @@ class AttributionGraph:
             node = self.nodes[node]
             if isinstance(node, OutputNode):
                 influence_sources[index] = node.probability
-
-        total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
-        logger.info(f"Completeness score: {total_error_influence:.3f}")
+        activation_sources = np.ones((n_initial,))
+        for index, node in enumerate(dedup_node_names):
+            node = self.nodes[node]
+            if isinstance(node, IntermediateNode):
+                activation_sources[index] = node.activation
 
         logger.info("Finding influence matrix")
         if not hasattr(self, "influence"):
@@ -149,6 +151,14 @@ class AttributionGraph:
             self.influence = influence
         else:
             influence = self.influence
+
+        influence = influence * activation_sources
+        influence = influence / np.maximum(1e-2, influence.sum(axis=1, keepdims=True))
+        adj_matrix = adj_matrix * activation_sources
+        adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
+
+        total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
+        logger.info(f"Completeness score: {total_error_influence:.3f}")
 
         total_error_influence = 1 - (influence_sources @ influence) @ error_mask
         logger.info(f"Replacement score: {total_error_influence:.3f}")
