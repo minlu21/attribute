@@ -79,6 +79,7 @@ class TranscodedModel(object):
             model_name,
             device_map={"": device},
             torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
         )
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = model
@@ -134,6 +135,7 @@ class TranscodedModel(object):
 
     def __call__(self, prompt: str, mask_features: dict[int, list[int]] = {}, errors_from: TranscodedOutputs | None = None) -> TranscodedOutputs:
         tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        logger.info(f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt['input_ids'][0]]}")
         self.clear_hooks()
 
         attn_values = {}
@@ -241,11 +243,18 @@ class TranscodedModel(object):
             final_ln = output
         self.final_ln.register_forward_hook(get_final_ln_hook)
 
-        outputs = self.model(**tokenized_prompt, output_attentions=True, output_hidden_states=True)
+        outputs = self.model(input_ids=tokenized_prompt.input_ids,
+                            #  attention_mask=tokenized_prompt.attention_mask,
+                             output_attentions=True, output_hidden_states=True)
         self.clear_hooks()
 
         attention_patterns = outputs.attentions
         logits = outputs.logits
+
+        logger.info("Top last token logits:")
+        for index in logits[0, -1].topk(10).indices:
+            logger.info(f"{self.decode_token(index)}: {logits[0, -1][index].item()}")
+
         last_layer_activations = outputs.hidden_states[-1]
 
         last_layer_activations.retain_grad()

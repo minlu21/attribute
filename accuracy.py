@@ -14,8 +14,10 @@ import torch
 from collections import defaultdict
 import numpy as np
 
-model_name = "roneneldan/TinyStories-33M"
-transcoder_path = "../e2e/checkpoints/clt-ts/test"
+# model_name = "roneneldan/TinyStories-33M"
+# transcoder_path = "../e2e/checkpoints/clt-ts/test"
+model_name = "nev/GELU_4L512W_C4_Code"
+transcoder_path = "../e2e/checkpoints/gelu-4l-clt/k64"
 
 model = TranscodedModel(
     model_name=model_name,
@@ -23,7 +25,8 @@ model = TranscodedModel(
     device="cuda",
 )
 #%%
-prompt = "When John and Mary went to the store, John gave a bag to"
+# prompt = "When John and Mary went to the store, John gave a bag to"
+prompt = "<|BOS|>National Data Attribution Graph ("
 og_activations = model(prompt)
 #%%
 config = AttributionConfig(
