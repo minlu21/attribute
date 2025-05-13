@@ -3,6 +3,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from jaxtyping import Array, Float, Int
@@ -122,9 +123,16 @@ class TranscodedModel(object):
             return 1
         return self.model.config.num_attention_heads // self.model.config.num_key_value_heads
 
-    def __call__(self, prompt: str, mask_features: dict[int, list[int]] = {}, errors_from: TranscodedOutputs | None = None) -> TranscodedOutputs:
-        tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        logger.info(f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt['input_ids'][0]]}")
+    def __call__(self, prompt: str | torch.Tensor, mask_features: dict[int, list[int]] = {},
+                 errors_from: TranscodedOutputs | None = None,
+                 no_error: bool = False) -> TranscodedOutputs:
+        if isinstance(prompt, str):
+            tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            logger.info(f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt.input_ids[0]]}")
+        elif isinstance(prompt, torch.Tensor):
+            tokenized_prompt = SimpleNamespace(input_ids=prompt.to(self.device))
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
         self.clear_hooks()
 
         attn_values = {}
@@ -220,7 +228,9 @@ class TranscodedModel(object):
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
 
-            if errors_from is None:
+            if no_error:
+                error = torch.zeros_like(output)
+            elif errors_from is None:
                 error = diff
             else:
                 error = errors_from.mlp_outputs[layer_idx].error
@@ -273,7 +283,7 @@ class TranscodedModel(object):
             )
 
         transcoded_outputs = TranscodedOutputs(
-            input_ids=tokenized_prompt["input_ids"],
+            input_ids=tokenized_prompt.input_ids,
             mlp_outputs=mlp_outputs,
             attn_outputs=attn_outputs,
             last_layer_activations=last_layer_activations,
