@@ -572,7 +572,7 @@ class AttributionGraph:
         )
         attn_pre_proj_gradient = attn_pre_proj_gradient * self.cache.attn_outputs[layer_index].ln_factor
 
-        return attn_pre_proj_gradient
+        return attn_pre_proj_gradient * 0
 
     @torch.no_grad()
     @torch.autocast("cuda")
@@ -611,9 +611,7 @@ class AttributionGraph:
             if not isinstance(target_node, OutputNode):
                 gradient = gradient * self.cache.mlp_outputs[max_layer].ln_factor
             else:
-                # just to fix the shape (insert batch dimension),
-                # the gradient is already scaled by the ln_factor
-                gradient = gradient * torch.ones_like(self.cache.final_ln_factor)
+                gradient = gradient.unsqueeze(0)
         all_mlp_contributions = {}
         past_gradients = {}
         with measure_time(

@@ -23,28 +23,18 @@ GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 
 @dataclass
 class MLPOutputs:
-    pre_second_ln: Float[Array, "batch seq_len hidden_size"]
-    second_ln: Float[Array, "batch seq_len hidden_size"]
+    ln_factor: Float[Array, "batch seq_len hidden_size"]
     activation: Float[Array, "batch seq_len k"]
     source_activation: Float[Array, "batch seq_len k"]
     location: Int[Array, "batch seq_len k"]
     error: Float[Array, "batch seq_len hidden_size"]
 
-    @property
-    def ln_factor(self):
-        return torch.nan_to_num(self.second_ln / self.pre_second_ln, nan=1.0, posinf=1.0, neginf=1.0)
-
 
 @dataclass
 class AttentionOutputs:
-    pre_first_ln: Float[Array, "batch seq_len hidden_size"]
-    first_ln: Float[Array, "batch seq_len hidden_size"]
+    ln_factor: Float[Array, "batch seq_len hidden_size"]
     attn_values: Float[Array, "batch num_attention_heads seq_len head_dim"]
     attn_patterns: Float[Array, "batch num_attention_heads seq_len seq_len"]
-
-    @property
-    def ln_factor(self):
-        return torch.nan_to_num(self.first_ln / self.pre_first_ln, nan=1.0, posinf=1.0, neginf=1.0)
 
 @dataclass
 class TranscodedOutputs:
@@ -52,13 +42,7 @@ class TranscodedOutputs:
     mlp_outputs: dict[int, MLPOutputs]
     attn_outputs: dict[int, AttentionOutputs]
     last_layer_activations: Float[Array, "batch seq_len hidden_size"]
-    pre_final_ln: Float[Array, "batch seq_len hidden_size"]
-    final_ln: Float[Array, "batch seq_len hidden_size"]
     logits: Float[Array, "batch seq_len vocab_size"]
-
-    @property
-    def final_ln_factor(self):
-        return torch.nan_to_num(self.final_ln / self.pre_final_ln, nan=1.0, posinf=1.0, neginf=1.0)
 
     @property
     def seq_len(self):
@@ -113,8 +97,9 @@ class TranscodedModel(object):
             self.transcoders[hookpoint] = sae
         self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
         self.hookpoints_ln = [f"{self.layer_prefix}.{i}.{self.mlp_layernorm_name}" for i in range(self.num_layers)]
+        self.hookpoints_attn_ln = [f"{self.layer_prefix}.{i}.{self.attn_layernorm_name}" for i in range(self.num_layers)]
         self.name_to_module = {
-            name: model.get_submodule(name) for name in self.hookpoints_layer + self.hookpoints_mlp + self.hookpoints_ln
+            name: model.get_submodule(name) for name in self.hookpoints_layer + self.hookpoints_mlp + self.hookpoints_ln + self.hookpoints_attn_ln
         }
         self.name_to_index = {
             k: i
@@ -144,15 +129,20 @@ class TranscodedModel(object):
 
         attn_values = {}
         first_ln = {}
-        pre_first_ln = {}
+
+        def ln_record_hook(module, input, output, save_dict):
+            mean = input[0].mean(dim=-1, keepdim=True).detach()
+            var = input[0].var(dim=-1, keepdim=True)
+            multiplier = (1 / torch.sqrt(var + module.eps).detach()) * module.weight
+            save_dict[self.module_to_name[module]] = multiplier
+            return (input[0] - mean) * multiplier + module.bias
+
 
         def get_attention_values_hook(module, input, output):
             # this hook is in the layer
             residual = input[0]
             layer_name = self.module_to_name[module]
-            pre_first_ln[layer_name] = residual
             layer_normed = getattr(module, self.attn_layernorm_name)(residual)
-            first_ln[layer_name] = layer_normed
 
             # stuff related to attention
             input_shape = layer_normed.shape[:-1]
@@ -165,6 +155,8 @@ class TranscodedModel(object):
 
         for hookpoint in self.hookpoints_layer:
             self.name_to_module[hookpoint].register_forward_hook(get_attention_values_hook)
+            ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
+            ln.register_forward_hook(partial(ln_record_hook, save_dict=first_ln))
 
             attn = self.attn(self.name_to_index[hookpoint])
             original_implementation = attn.config._attn_implementation
@@ -185,7 +177,7 @@ class TranscodedModel(object):
                     attn_output = torch.matmul(attn_weights, value)
                     attn_output = attn_output.transpose(1, 2)
 
-                    return attn_output, attn_weights
+                    return attn_output.detach(), attn_weights
                 if isinstance(self.model, GPT2PreTrainedModel):
                     eager_attention_forward = gpt2_eager_attention_forward
                 else:
@@ -199,26 +191,8 @@ class TranscodedModel(object):
             attn.config._attn_implementation = no_grad_name
 
         second_ln = {}
-        pre_second_ln = {}
-
-        def get_ln2_hook(module, input, output):
-            pre_second_ln[self.module_to_name[module]] = input[0]
-            second_ln[self.module_to_name[module]] = output
-
-        @torch.compile
-        def ln_freeze_hook(module, input, output):
-            mean = input[0].mean(dim=-1, keepdim=True).detach()
-            var = input[0].var(dim=-1, keepdim=True).detach()
-            normalized = (input[0] - mean) / torch.sqrt(var + module.eps)
-            return normalized * module.weight + module.bias
-
         for hookpoint in self.hookpoints_ln:
-            self.name_to_module[hookpoint].register_forward_hook(get_ln2_hook)
-            self.name_to_module[hookpoint].register_forward_hook(ln_freeze_hook)
-
-        for hookpoint in self.hookpoints_layer:
-            getattr(self.name_to_module[hookpoint], self.attn_layernorm_name).register_forward_hook(ln_freeze_hook)
-
+            self.name_to_module[hookpoint].register_forward_hook(partial(ln_record_hook, save_dict=second_ln))
 
         transcoder_outputs = {}
         target_transcoder_activations = {}
@@ -236,7 +210,7 @@ class TranscodedModel(object):
             batch_dims = input.shape[:-1]
             input = input.view(-1, input.shape[-1])
             # have to normalize input
-            transcoder_acts = transcoder(input)
+            transcoder_acts = transcoder(input, return_mid_decoder=True)
 
             target_latent_acts = transcoder_acts.latent_acts.clone().unflatten(0, batch_dims)
             source_latent_acts = transcoder_acts.latent_acts
@@ -295,13 +269,6 @@ class TranscodedModel(object):
         for hookpoint in self.hookpoints_mlp:
             self.name_to_module[hookpoint].register_forward_hook(get_mlp_hook)
 
-        pre_final_ln, final_ln = None, None
-        def get_final_ln_hook(module, input, output):
-            nonlocal pre_final_ln, final_ln
-            pre_final_ln = input[0]
-            final_ln = output
-        self.final_ln.register_forward_hook(get_final_ln_hook)
-
         outputs = self.model(input_ids=tokenized_prompt.input_ids,
                             #  attention_mask=tokenized_prompt.attention_mask,
                              output_attentions=True, output_hidden_states=True)
@@ -321,8 +288,7 @@ class TranscodedModel(object):
         mlp_outputs = {}
         for i in range(self.num_layers):
             mlp_outputs[i] = MLPOutputs(
-                pre_second_ln=pre_second_ln[self.hookpoints_ln[i]],
-                second_ln=second_ln[self.hookpoints_ln[i]],
+                ln_factor=second_ln[self.hookpoints_ln[i]],
                 activation=target_transcoder_activations[self.hookpoints_mlp[i]],
                 source_activation=source_transcoder_activations[self.hookpoints_mlp[i]],
                 location=transcoder_locations[self.hookpoints_mlp[i]],
@@ -331,8 +297,7 @@ class TranscodedModel(object):
         attn_outputs = {}
         for i in range(self.num_layers):
             attn_outputs[i] = AttentionOutputs(
-                pre_first_ln=pre_first_ln[self.hookpoints_layer[i]],
-                first_ln=first_ln[self.hookpoints_layer[i]],
+                ln_factor=first_ln[self.hookpoints_attn_ln[i]],
                 attn_values=attn_values[self.hookpoints_layer[i]],
                 attn_patterns=attention_patterns[i],
             )
@@ -342,8 +307,6 @@ class TranscodedModel(object):
             mlp_outputs=mlp_outputs,
             attn_outputs=attn_outputs,
             last_layer_activations=last_layer_activations,
-            pre_final_ln=pre_final_ln,
-            final_ln=final_ln,
             logits=logits,
         )
 
@@ -458,7 +421,10 @@ class TranscodedModel(object):
         except AttributeError:
             assert target_layer_idx is not None, "target_layer_idx must be provided for multi-target transcoders"
             assert target_layer_idx >= layer_idx
-            w_skip = self.transcoders[self.hookpoints_mlp[layer_idx]].W_skips[target_layer_idx - layer_idx]
+            try:
+                w_skip = self.transcoders[self.hookpoints_mlp[layer_idx]].W_skips[target_layer_idx - layer_idx]
+            except AttributeError:
+                return torch.zeros((self.hidden_size, self.hidden_size), device=self.device, dtype=torch.float32)
             return w_skip
         else:
             if target_layer_idx != layer_idx:

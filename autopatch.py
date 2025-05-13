@@ -17,7 +17,8 @@ import numpy as np
 # model_name = "roneneldan/TinyStories-33M"
 # transcoder_path = "../e2e/checkpoints/clt-ts/test"
 model_name = "nev/GELU_4L512W_C4_Code"
-transcoder_path = "../e2e/checkpoints/gelu-4l-clt/k64"
+# transcoder_path = "../e2e/checkpoints/gelu-4l-clt/k64"
+transcoder_path = "../e2e/checkpoints/gelu-4l-nonclt/baseline"
 
 model = TranscodedModel(
     model_name=model_name,
@@ -38,7 +39,7 @@ graph.flow()
 #%%
 adj_matrix, dedup_node_names = graph.adjacency_matrix(normalize=False, absolute=False,)
 #%%
-# random.seed(10)
+random.seed(10)
 reals = []
 preds = []
 for _ in range(1024):
@@ -71,12 +72,13 @@ for _ in range(1024):
     target_k = og_activations.mlp_outputs[target_layer].location[0, target_seq].tolist().index(target_feature)
     target_act = og_activations.mlp_outputs[target_layer].activation[0, target_seq, target_k]
 
-    real, pred = torch.autograd.grad(target_act, source_act, retain_graph=True)[0][0, source_seq, source_k].item(), float(predicted_influence)
+    real = torch.autograd.grad(target_act, source_act, retain_graph=True)[0][0, source_seq, source_k].item()
+    pred = float(predicted_influence)
+
     reals.append(real)
     preds.append(pred)
-#%%
 from matplotlib import pyplot as plt
-plt.scatter(reals, preds)
+plt.scatter(reals, preds, s=1)
 plt.xlabel("Real influence")
 plt.ylabel("Predicted influence")
 plt.xlim(-1, 1)
