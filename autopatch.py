@@ -18,6 +18,7 @@ import numpy as np
 # transcoder_path = "../e2e/checkpoints/clt-ts/test"
 model_name = "nev/GELU_4L512W_C4_Code"
 transcoder_path = "../e2e/checkpoints/gelu-4l-clt/k64"
+# transcoder_path = "../e2e/checkpoints/gelu-4l-clt-noskip/baseline"
 # transcoder_path = "../e2e/checkpoints/gelu-4l-nonclt/baseline"
 
 model = TranscodedModel(
@@ -75,8 +76,9 @@ for _ in range(1024):
     preds.append(pred)
 from matplotlib import pyplot as plt
 plt.scatter(reals, preds, s=1)
-plt.xlabel("Real influence")
-plt.ylabel("Predicted influence")
+plt.plot([-1, 1], [-1, 1], "k--")
+plt.xlabel("Automatic influence")
+plt.ylabel("Manual influence")
 plt.xlim(-1, 1)
 plt.ylim(-1, 1)
 plt.show()

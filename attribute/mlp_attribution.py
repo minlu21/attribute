@@ -520,7 +520,10 @@ class AttributionGraph:
             while activations.ndim > 2:
                 activations = activations[0]
                 indices = indices[0]
-            w_dec = self.model.w_dec(source_layer, layer_index)
+            try:
+                w_dec = self.model.w_dec(source_layer, layer_index)
+            except IndexError:
+                continue
             similarities = torch.einsum(
                 "...fd,...d->...f",
                 w_dec[indices]
@@ -623,7 +626,7 @@ class AttributionGraph:
                 desc=f"Computing MLP contributions of node {target_node.id}",
                 disable=True,
             ):
-                start_gradient = gradient
+                start_gradient = gradient.clone()
                 # pass skip gradient (just after the MLP) to the previous layer
                 past_gradients[layer] = start_gradient
                 if layer != max_layer:
@@ -642,7 +645,10 @@ class AttributionGraph:
                         try:
                             skipped += grad @ self.model.w_skip(layer, target_layer)
                         except IndexError:
-                            to_delete.add(target_layer)
+                            try:
+                                self.model.w_dec(layer, target_layer)
+                            except IndexError:
+                                to_delete.add(target_layer)
                     for target_layer in to_delete:
                         del past_gradients[target_layer]
                     skipped = skipped * self.cache.mlp_outputs[layer].ln_factor

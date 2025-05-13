@@ -319,7 +319,7 @@ class TranscodedModel(object):
 
     @property
     def parallel_attn(self):
-        return isinstance(self.model, GPT2Like)
+        return isinstance(self.model, GPTNeoPreTrainedModel)
 
     @property
     def final_ln(self):
@@ -366,6 +366,8 @@ class TranscodedModel(object):
     @torch.autocast("cuda")
     def w_dec(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "features hidden_size"]:
         try:
+            if target_layer_idx != layer_idx:
+                raise AttributeError
             return self.transcoders[self.hookpoints_mlp[layer_idx]].W_dec
         except AttributeError:
             if target_layer_idx is None:
@@ -382,7 +384,10 @@ class TranscodedModel(object):
                 return weight_combined
             # assume the target layer is contiguous
             assert target_layer_idx >= layer_idx
-            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_decs[target_layer_idx - layer_idx]
+            try:
+                return self.transcoders[self.hookpoints_mlp[layer_idx]].W_decs[target_layer_idx - layer_idx]
+            except AttributeError:
+                raise IndexError
 
     def w_skip(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "hidden_size hidden_size"]:
         try:
@@ -393,7 +398,9 @@ class TranscodedModel(object):
             try:
                 w_skip = self.transcoders[self.hookpoints_mlp[layer_idx]].W_skips[target_layer_idx - layer_idx]
             except AttributeError:
-                return torch.zeros((self.hidden_size, self.hidden_size), device=self.device, dtype=torch.float32)
+                raise IndexError
+            if w_skip is None:
+                raise IndexError
             return w_skip
         else:
             if target_layer_idx != layer_idx:
