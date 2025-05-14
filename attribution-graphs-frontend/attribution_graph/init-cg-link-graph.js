@@ -238,10 +238,22 @@ window.initCgLinkGraph = function({visState, renderAll, data, cgSel}){
   function renderHiddenIds(){
     var hiddenIdSet = new Set(visState.hiddenIds)
     nodeSel.classed('hidden', d => hiddenIdSet.has(d.featureId))
+    // drawLinks(links, allCtx.allLinks, 0, 'rgba(0,0,0,.05)')
+    drawLinks(links.filter(link => {
+      return !hiddenIdSet.has(link.sourceNode.featureId) && !hiddenIdSet.has(link.targetNode.featureId)
+    }), allCtx.allLinks, 0, 'rgba(0,0,0,.05)')
   }
   renderAll.hiddenIds.fns['linkGraph'] = renderHiddenIds
 
   function renderClicked(){
+    var newClickedLink = visState.clickedId;
+    var newClickedFeatureId = nodes.find(d => d.nodeId == newClickedLink)?.featureId
+    var index = visState.hiddenIds.indexOf(newClickedFeatureId);
+    if (index != -1) {
+      visState.hiddenIds.splice(index, 1);
+      renderAll.hiddenIds()
+    }
+
     var clickedLinks = []
     // if (visState.clickedId) {
     //   clickedLinks = links.filter(link =>

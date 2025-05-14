@@ -30,11 +30,22 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
   d3.select('body')
     .on('keydown.grouping' + data.metadata.slug, ev => {
       if (ev.repeat) return
-      if (!visState.isEditMode || ev.key != 'g') return
-      subgraphState.activeGrouping.isActive = true
-      styleNodes()
+      if (visState.isEditMode && ev.key == 'g') {
+        subgraphState.activeGrouping.isActive = true
+        styleNodes()
 
-      subgraphSel.classed('is-grouping', true)
+        subgraphSel.classed('is-grouping', true)
+      } else if (visState.isEditMode && ev.key == "Backspace" && !!visState.clickedId) {
+        var clickedId = visState.clickedId
+        var clickedFeatureId = nodes.find(d => d.nodeId == clickedId)?.featureId
+        visState.clickedId = null
+        visState.pinnedIds = visState.pinnedIds.filter(id => id != clickedId)
+        visState.hiddenIds.push(clickedFeatureId);
+        renderAll.pinnedIds()
+        renderAll.hiddenIds()
+        renderSubgraph()
+        renderAll.clickedId({skipBroadcast: false})
+      }
     })
     .on('keyup.grouping' + data.metadata.slug, ev => {
       if (!visState.isEditMode || ev.key != 'g') return

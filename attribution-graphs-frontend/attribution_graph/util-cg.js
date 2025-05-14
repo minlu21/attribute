@@ -172,7 +172,10 @@ window.utilCg = (function(){
       d.active_feature_idx = d.feature
       d.nodeIndex = i
 
-      if (d.feature_type == 'logit') d.layer = maxLayer + 1
+      if (d.feature_type == 'logit') {
+        d.layer = maxLayer + 1
+        d.featureId += '__output_idx_' + d.node_id.split("_").pop();
+      }
 
       // TODO: does this handle error nodes correctly?
       if (d.feature_type == 'unexplored node' && !d.layer != 'E'){

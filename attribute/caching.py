@@ -74,6 +74,8 @@ class TranscodedModel(object):
         self.model = model
         self.tokenizer = tokenizer
 
+        if transcoder_path is None:
+            return
         if hookpoint_fn is None:
             def hookpoint_fn(hookpoint):
                 if isinstance(model, LlamaPreTrainedModel):
@@ -316,6 +318,13 @@ class TranscodedModel(object):
             return "post_attention_layernorm"
         elif isinstance(self.model, GPT2Like):
             return "ln_2"
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    @property
+    def mlp_in_proj_name(self):
+        if isinstance(self.model, GPT2Like):
+            return "c_proj"
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 

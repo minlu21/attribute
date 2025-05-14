@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 CUDA_VISIBLE_DEVICES=1 uv run python -m attribute --model_name="nev/GELU_4L512W_C4_Code" \
---transcoder_path="../e2e/checkpoints/gelu-4l-nonclt-skip/ef64k64" \
---cache_path=results/transcoder_gelu4l_x64k64-0/latents \
+--transcoder_path="../e2e/checkpoints/gelu-4l-clt/ef128k64" \
+--cache_path=results/transcoder_gelu4l_x128k64-0/latents \
 --name "test-1-gelu4l" \
---scan "gelu-4l-k64-v2" \
+--scan "gelu-4l-x128k64-v0" \
 --remove_bos True \
 "<|BOS|>The National Digital Analytics Group ("
 exit

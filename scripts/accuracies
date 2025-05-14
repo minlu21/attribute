@@ -1,0 +1,14 @@
+#!/bin/sh
+export CUDA_VISIBLE_DEVICES=6
+set -e
+uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/ef128k64
+# uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/ef128k64_
+# uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt/k64
+# uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-nonclt/baseline
+# uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-clt-noskip/baseline
+# uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-nonclt-skip/baseline
+# uv run python evaluate.py --transcoder_path ../e2e/checkpoints/gelu-4l-nonclt-skip/ef64k64
+# uv run python evaluate.py --mlp_trim 50
+# uv run python evaluate.py --mlp_trim 100
+# uv run python evaluate.py --mlp_trim 200
+# uv run python evaluate.py --mlp_trim 500

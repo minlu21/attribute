@@ -4,6 +4,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
+from collections import OrderedDict
 
 import IPython
 if ip := IPython.get_ipython():
@@ -27,6 +28,9 @@ def parse_args():
     parser.add_argument('--transcoder_path', type=str,
                       default="../e2e/checkpoints/gelu-4l-clt/ef128k64",
                       help='Path to transcoder')
+    parser.add_argument('--mlp_trim', type=int,
+                      default=0,
+                      help='Fix MLP L0 to this value')
     parser.add_argument('--output_path', type=str, default="results/accuracy",
                       help='Directory to save results')
     parser.add_argument('--batch_size', type=int, default=128,
@@ -41,7 +45,7 @@ def main():
     # Initialize model with specified transcoder for feature attribution
     model = TranscodedModel(
         args.model,
-        transcoder_path=args.transcoder_path,
+        transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
     )
 
     # Load and preprocess dataset into fixed-length chunks for efficient batching
@@ -67,39 +71,57 @@ def main():
     accuracies = []  # Token-level accuracy
     kl_divs = []    # KL divergence between predicted and true distributions
 
+    def mlp_trimmer(module, input, output):
+        values, indices = torch.topk(output, args.mlp_trim, dim=-1)
+        output = torch.zeros_like(output)
+        output.scatter_(dim=-1, index=indices, src=values)
+        return output
+
     # Evaluate on full dataset
-    for batch in (bar := tqdm(dataloader, desc="Evaluating")):
-        input_ids = batch["input_ids"].to(model.device)
-        with torch.no_grad():
-            out_base = model.model(input_ids)
-            base_logits = out_base.logits
-            out = model(input_ids, no_error=True)
-            logits = out.logits
+    try:
+        for batch in (bar := tqdm(dataloader, desc="Evaluating")):
+            input_ids = batch["input_ids"].to(model.device)
+            with torch.no_grad():
+                out_base = model.model(input_ids)
+                base_logits = out_base.logits
+                if args.mlp_trim > 0:
+                    for layer_idx in range(model.num_layers):
+                        mlp = model.model.get_submodule(f"{model.layer_prefix}.{layer_idx}.mlp")
+                        in_proj = getattr(mlp, model.mlp_in_proj_name)
+                        in_proj.register_forward_hook(mlp_trimmer)
+                    out = model.model(input_ids)
+                    for m in model.model.modules():
+                        m._forward_hooks = OrderedDict()
+                else:
+                    out = model(input_ids, no_error=True)
+                logits = out.logits
 
-            # Calculate token-level accuracy
-            pred_tokens = logits.argmax(dim=-1)
-            base_tokens = base_logits.argmax(dim=-1)
-            accuracy = (pred_tokens == base_tokens).float().mean().item()
-            accuracies.append(accuracy)
+                # Calculate token-level accuracy
+                pred_tokens = logits.argmax(dim=-1)
+                base_tokens = base_logits.argmax(dim=-1)
+                accuracy = (pred_tokens == base_tokens).float().mean().item()
+                accuracies.append(accuracy)
 
-            # Calculate KL divergence between predicted and true distributions
-            log_probs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
-            base_log_probs = F.log_softmax(base_logits, dim=-1)  # [batch, seq_len, vocab_size]
+                # Calculate KL divergence between predicted and true distributions
+                log_probs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+                base_log_probs = F.log_softmax(base_logits, dim=-1)  # [batch, seq_len, vocab_size]
 
-            # Calculate KL divergence for this batch
-            kl_div = F.kl_div(
-                log_probs.view(-1, logits.size(-1)),
-                base_log_probs.view(-1, logits.size(-1)),
-                reduction='batchmean',
-                log_target=True
-            ).item()
-            kl_divs.append(kl_div)
+                # Calculate KL divergence for this batch
+                kl_div = F.kl_div(
+                    log_probs.view(-1, logits.size(-1)),
+                    base_log_probs.view(-1, logits.size(-1)),
+                    reduction='batchmean',
+                    log_target=True
+                ).item()
+                kl_divs.append(kl_div)
 
-            # Update progress bar with current and running average metrics
-            bar.set_postfix({
-                "Avg Acc": f"{np.mean(accuracies):.4f}",
-                "Avg KL": f"{np.mean(kl_divs):.4f}"
-            })
+                # Update progress bar with current and running average metrics
+                bar.set_postfix({
+                    "Avg Acc": f"{np.mean(accuracies):.4f}",
+                    "Avg KL": f"{np.mean(kl_divs):.4f}"
+                })
+    except KeyboardInterrupt:
+        pass
 
     # Calculate final statistics
     mean_accuracy = np.mean(accuracies)
@@ -110,7 +132,11 @@ def main():
     # Prepare comprehensive results dictionary
     results = {
         "model": args.model,
-        "transcoder_path": args.transcoder_path,
+        **(
+            {"transcoder_path": args.transcoder_path}
+            if args.mlp_trim == 0
+            else {"mlp_trim": args.mlp_trim}
+        ),
         "timestamp": datetime.now().isoformat(),
         "accuracy": {
             "mean": mean_accuracy,
@@ -133,6 +159,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     escaped_model_name = args.model.replace("/", "_").replace(":", "_")
     escaped_transcoder_name = args.transcoder_path.replace("/", "_").replace(":", "_")
+    if args.mlp_trim > 0:
+        escaped_transcoder_name = f"mlp_trim_{args.mlp_trim}"
     escaped_model_transcoder_name = f"{escaped_model_name}-{escaped_transcoder_name}"
     output_file = output_dir / f"eval_results_{escaped_model_transcoder_name}.json"
 
