@@ -1,4 +1,10 @@
-#%%
+# Evaluation script for measuring model performance on next token prediction
+# Calculates token-level accuracy and KL divergence between predicted and true distributions
+import argparse
+import json
+from datetime import datetime
+from pathlib import Path
+
 import IPython
 if ip := IPython.get_ipython():
     ip.run_line_magic("load_ext", "autoreload")
@@ -10,32 +16,134 @@ from datasets import load_dataset
 from multiprocessing import cpu_count
 from tqdm.auto import tqdm
 import torch
+import torch.nn.functional as F
+import numpy as np
 from loguru import logger
 
-model = TranscodedModel(
-    "nev/GELU_4L512W_C4_Code",
-    transcoder_path="../e2e/checkpoints/gelu-4l-clt/ef128k64",
-)
-#%%
-dataset = load_dataset("NeelNanda/pile-10k", split="train")
-dataset = chunk_and_tokenize(
-    dataset,
-    model.tokenizer,
-    max_seq_len=128,
-    num_proc=cpu_count() // 2,
-    text_key="text",
-    return_overflowed_tokens=True,
-)
-# %%
-logger.remove()
-batch_size = 128
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=cpu_count() // 2)
-for batch in (bar := tqdm(dataloader)):
-    input_ids = batch["input_ids"].to(model.device)
-    out = model(input_ids[:, :-1], no_error=True)
-    logits = out.logits
-    logits = logits.argmax(dim=-1)
-    accuracy = (logits == input_ids[:, 1:]).float().mean().item()
-    print(f"Accuracy: {accuracy}")
-    break
-# %%
+def parse_args():
+    parser = argparse.ArgumentParser(description='Evaluate model accuracy and KL divergence on next token prediction')
+    parser.add_argument('--model', type=str, default="nev/GELU_4L512W_C4_Code",
+                      help='Model name or path')
+    parser.add_argument('--transcoder_path', type=str,
+                      default="../e2e/checkpoints/gelu-4l-clt/ef128k64",
+                      help='Path to transcoder')
+    parser.add_argument('--output_path', type=str, default="results/accuracy",
+                      help='Directory to save results')
+    parser.add_argument('--batch_size', type=int, default=128,
+                      help='Batch size for evaluation')
+    parser.add_argument('--max_seq_len', type=int, default=128,
+                      help='Maximum sequence length for evaluation')
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+
+    # Initialize model with specified transcoder for feature attribution
+    model = TranscodedModel(
+        args.model,
+        transcoder_path=args.transcoder_path,
+    )
+
+    # Load and preprocess dataset into fixed-length chunks for efficient batching
+    dataset = load_dataset("NeelNanda/pile-10k", split="train")
+    dataset = chunk_and_tokenize(
+        dataset,
+        model.tokenizer,
+        max_seq_len=args.max_seq_len,
+        num_proc=cpu_count() // 2,
+        text_key="text",
+        return_overflowed_tokens=True,
+    )
+
+    # Setup data loading with multiprocessing
+    logger.remove()  # Remove default logger to avoid clutter during evaluation
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=cpu_count() // 2
+    )
+
+    # Track metrics across batches
+    accuracies = []  # Token-level accuracy
+    kl_divs = []    # KL divergence between predicted and true distributions
+
+    # Evaluate on full dataset
+    for batch in (bar := tqdm(dataloader, desc="Evaluating")):
+        input_ids = batch["input_ids"].to(model.device)
+        with torch.no_grad():
+            out_base = model.model(input_ids)
+            base_logits = out_base.logits
+            out = model(input_ids, no_error=True)
+            logits = out.logits
+
+            # Calculate token-level accuracy
+            pred_tokens = logits.argmax(dim=-1)
+            base_tokens = base_logits.argmax(dim=-1)
+            accuracy = (pred_tokens == base_tokens).float().mean().item()
+            accuracies.append(accuracy)
+
+            # Calculate KL divergence between predicted and true distributions
+            log_probs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+            base_log_probs = F.log_softmax(base_logits, dim=-1)  # [batch, seq_len, vocab_size]
+
+            # Calculate KL divergence for this batch
+            kl_div = F.kl_div(
+                log_probs.view(-1, logits.size(-1)),
+                base_log_probs.view(-1, logits.size(-1)),
+                reduction='batchmean',
+                log_target=True
+            ).item()
+            kl_divs.append(kl_div)
+
+            # Update progress bar with current and running average metrics
+            bar.set_postfix({
+                "Avg Acc": f"{np.mean(accuracies):.4f}",
+                "Avg KL": f"{np.mean(kl_divs):.4f}"
+            })
+
+    # Calculate final statistics
+    mean_accuracy = np.mean(accuracies)
+    std_accuracy = np.std(accuracies)
+    mean_kl = np.mean(kl_divs)
+    std_kl = np.std(kl_divs)
+
+    # Prepare comprehensive results dictionary
+    results = {
+        "model": args.model,
+        "transcoder_path": args.transcoder_path,
+        "timestamp": datetime.now().isoformat(),
+        "accuracy": {
+            "mean": mean_accuracy,
+            "std": std_accuracy,
+        },
+        "kl_divergence": {
+            "mean": mean_kl,
+            "std": std_kl,
+        },
+        "metadata": {
+            "dataset": "NeelNanda/pile-10k",
+            "batch_size": args.batch_size,
+            "num_batches": len(accuracies),
+            "total_tokens": len(accuracies) * args.batch_size * (args.max_seq_len - 1),  # -1 for next token prediction
+        }
+    }
+
+    # Save results with timestamp for tracking experiments
+    output_dir = Path(args.output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    escaped_model_name = args.model.replace("/", "_").replace(":", "_")
+    escaped_transcoder_name = args.transcoder_path.replace("/", "_").replace(":", "_")
+    escaped_model_transcoder_name = f"{escaped_model_name}-{escaped_transcoder_name}"
+    output_file = output_dir / f"eval_results_{escaped_model_transcoder_name}.json"
+
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    # Print summary statistics
+    print("\nEvaluation Results:")
+    print(f"Token Accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}")
+    print(f"KL Divergence: {mean_kl:.4f} ± {std_kl:.4f}")
+    print(f"Results saved to: {output_file}")
+
+if __name__ == "__main__":
+    main()

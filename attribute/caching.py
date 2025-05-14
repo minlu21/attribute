@@ -262,8 +262,8 @@ class TranscodedModel(object):
             logger.info(f"{self.decode_token(index)}: {logits[0, -1][index].item()}")
 
         last_layer_activations = outputs.hidden_states[-1]
-
-        last_layer_activations.retain_grad()
+        if last_layer_activations.requires_grad:
+            last_layer_activations.retain_grad()
 
         mlp_outputs = {}
         for i in range(self.num_layers):
