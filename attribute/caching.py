@@ -29,6 +29,7 @@ class MLPOutputs:
     source_activation: Float[Array, "batch seq_len k"]
     location: Int[Array, "batch seq_len k"]
     error: Float[Array, "batch seq_len hidden_size"]
+    source_error: Float[Array, "batch seq_len hidden_size"]
 
 
 @dataclass
@@ -43,6 +44,7 @@ class TranscodedOutputs:
     mlp_outputs: dict[int, MLPOutputs]
     attn_outputs: dict[int, AttentionOutputs]
     last_layer_activations: Float[Array, "batch seq_len hidden_size"]
+    first_layer_activations: Float[Array, "batch seq_len hidden_size"]
     logits: Float[Array, "batch seq_len vocab_size"]
 
     @property
@@ -217,6 +219,7 @@ class TranscodedModel(object):
                 out = v(
                     None,
                     addition=(0 if k != module_name else sae_out) / divide_by,
+                    no_extras=k != module_name,
                 )
                 if k == module_name:
                     sae_out = out.sae_out
@@ -236,7 +239,9 @@ class TranscodedModel(object):
                 error = diff
             else:
                 error = errors_from.mlp_outputs[layer_idx].error
-            error.detach_().requires_grad_(True)
+            error = error.clone()
+            error.detach_()
+            error.requires_grad_(True)
             logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
 
             latent_indices = transcoder_acts.latent_indices.unflatten(0, batch_dims)
@@ -244,9 +249,9 @@ class TranscodedModel(object):
             source_transcoder_activations[module_name] = source_latent_acts
             transcoder_locations[module_name] = latent_indices
 
+            result = (transcoder_out + error).to(output)
             errors[module_name] = error
-
-            return (transcoder_out + error).to(output)
+            return result
 
         for hookpoint in self.hookpoints_mlp:
             self.name_to_module[hookpoint].register_forward_hook(get_mlp_hook)
@@ -263,6 +268,10 @@ class TranscodedModel(object):
         for index in logits[0, -1].topk(10).indices:
             logger.info(f"{self.decode_token(index)}: {logits[0, -1][index].item()}")
 
+        first_layer_activations = outputs.hidden_states[0]
+        if first_layer_activations.requires_grad:
+            first_layer_activations.retain_grad()
+
         last_layer_activations = outputs.hidden_states[-1]
         if last_layer_activations.requires_grad:
             last_layer_activations.retain_grad()
@@ -275,6 +284,7 @@ class TranscodedModel(object):
                 source_activation=source_transcoder_activations[self.hookpoints_mlp[i]],
                 location=transcoder_locations[self.hookpoints_mlp[i]],
                 error=errors[self.hookpoints_mlp[i]],
+                source_error=errors[self.hookpoints_mlp[i]],
             )
         attn_outputs = {}
         for i in range(self.num_layers):
@@ -288,6 +298,7 @@ class TranscodedModel(object):
             input_ids=tokenized_prompt.input_ids,
             mlp_outputs=mlp_outputs,
             attn_outputs=attn_outputs,
+            first_layer_activations=first_layer_activations,
             last_layer_activations=last_layer_activations,
             logits=logits,
         )
