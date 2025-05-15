@@ -296,7 +296,8 @@ class AttributionGraph:
 
         ds = LatentDataset(
             cache_path,
-            SamplerConfig(), ConstructorConfig(),
+            SamplerConfig(n_examples_train=10, train_type="top", n_examples_test=0),
+            ConstructorConfig(center_examples=False),
             modules=natsorted(module_latents.keys()),
             latents=module_latents,
         )
@@ -339,6 +340,7 @@ class AttributionGraph:
                 finally:
                     logger.enable("attribute.caching")
                 logits = logit_weight @ dec_weight
+                del dec_weight
                 if self.config.use_logit_bias:
                     logits += logit_bias
                 top_logits = logits.topk(10).indices.tolist()

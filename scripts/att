@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-CUDA_VISIBLE_DEVICES=1 uv run python -m attribute --model_name="nev/GELU_4L512W_C4_Code" \
+uv run python -m attribute --model_name="nev/GELU_4L512W_C4_Code" \
 --transcoder_path="../e2e/checkpoints/gelu-4l-clt/ef128k64" \
 --cache_path=results/transcoder_gelu4l_x128k64-0/latents \
 --name "test-1-gelu4l" \

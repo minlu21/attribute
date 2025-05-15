@@ -394,19 +394,24 @@ class TranscodedModel(object):
                 logger.warning("Summing decoder weights because target_layer_idx is None")
                 target_layer_idx = layer_idx
                 weight_combined = torch.zeros((self.w_dec(layer_idx, layer_idx).shape[0], self.hidden_size,), device=self.device, dtype=torch.float32)
-                weights_at_layers = {}
-                while target_layer_idx < self.num_layers:
-                    weights_at_layers[target_layer_idx] = weight_combined
-                    for layer_from, weight_at in weights_at_layers.items():
-                        try:
-                            weight_combined += weight_at @ self.w_skip(layer_from, target_layer_idx).T
-                        except IndexError:
-                            pass
+                for target_layer_idx in range(layer_idx, self.num_layers):
                     try:
                         weight_combined += self.w_dec(layer_idx, target_layer_idx)
                     except IndexError:
-                        pass
-                    target_layer_idx += 1
+                        break
+                # weights_at_layers = {}
+                # while target_layer_idx < self.num_layers:
+                #     weights_at_layers[target_layer_idx] = weight_combined
+                #     for layer_from, weight_at in weights_at_layers.items():
+                #         try:
+                #             weight_combined += weight_at @ self.w_skip(layer_from, target_layer_idx).T
+                #         except IndexError:
+                #             pass
+                #     try:
+                #         weight_combined += self.w_dec(layer_idx, target_layer_idx)
+                #     except IndexError:
+                #         pass
+                #     target_layer_idx += 1
                 return weight_combined
             # assume the target layer is contiguous
             assert target_layer_idx >= layer_idx
