@@ -2,7 +2,7 @@ import json
 import os
 import random
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -482,83 +482,6 @@ class AttributionGraph:
         self.queue = NodeQueue()
         self.remaining_output_nodes = output_nodes.copy()
 
-    def compute_mlp_node_contribution(
-        self,
-        node: Node,
-        target_node: Node,
-        vector: Tensor,
-    ) -> Contribution:
-        dot_product = torch.dot(vector.float(), node.output_vector.float())
-        attribution = dot_product.item()
-
-        return Contribution(
-            source=node,
-            target=target_node,
-            contribution=attribution,
-        )
-
-    def mlp_contribution(
-        self, contribution_vector: torch.Tensor, layer_index: int
-    ) -> dict[str, Contribution]:
-        contributions = {}
-
-        for token_position in range(contribution_vector.shape[-2]):
-            contribution_direction = contribution_vector[..., token_position, :]
-            # TODO
-            while contribution_direction.ndim > 1:
-                contribution_direction = contribution_direction[0]
-            nodes = self.nodes_by_layer_and_token[layer_index][token_position]
-            # filter out the attention nodes and the embedding node
-            nodes = [
-                node
-                for node in nodes
-                if isinstance(node, ErrorNode)
-            ]
-            # get the contribution of each node
-            for node in tqdm(nodes, desc="Computing Node contributions", disable=True):
-                new_contribution = self.compute_mlp_node_contribution(
-                    node,
-                    None,
-                    contribution_direction,
-                )
-                contributions[new_contribution.source.id] = new_contribution
-
-        contribution = contribution_vector
-        while contribution.ndim > 2:
-            contribution = contribution[0]
-        for source_layer in range(layer_index + 1):
-            acts = self.activation_indices_tensors[source_layer]
-            activations, indices = acts["activations"], acts["indices"]
-            while activations.ndim > 2:
-                activations = activations[0]
-                indices = indices[0]
-            try:
-                w_dec = self.model.w_dec(source_layer, layer_index)
-            except IndexError:
-                continue
-            similarities = torch.einsum(
-                "...fd,...d->...f",
-                w_dec[indices]
-                * activations[..., None]
-                , contribution)
-            time_idx, feature_idx = torch.nonzero(similarities.abs() >= self.config.pre_filter_threshold, as_tuple=True)
-            sims = similarities[time_idx, feature_idx].tolist()
-            time_idx = time_idx.tolist()
-            indexes = indices[time_idx, feature_idx].tolist()
-            for t, s, i in zip(time_idx, sims, indexes):
-                source_id = f"intermediate_{t}_{source_layer}_{i}"
-                source = self.nodes[source_id]
-                contributions[source_id] = Contribution(
-                    source=source,
-                    target=None,
-                    contribution=s / source.activation
-                )
-
-        return {
-            k: replace(contribution, contribution=float(contribution.contribution))
-            for k, contribution in contributions.items()
-        }
-
     def attn_backward(
         self,
         # batch size, seq_len, d_model
@@ -589,7 +512,6 @@ class AttributionGraph:
 
         return attn_pre_proj_gradient
 
-    @torch.no_grad()
     @torch.autocast("cuda")
     def flow_once(self):
         with measure_time(
@@ -612,86 +534,71 @@ class AttributionGraph:
 
             # compute all the contributions
             max_layer = target_node.layer_index
-            gradient = target_node.input_vector
-            if gradient.ndim == 1:
-                gradient = gradient.unsqueeze(0)
-                gradient = gradient.repeat(self.seq_len, 1)
-                gradient = (
-                    gradient
-                    * (
-                        torch.arange(0, self.seq_len, device=gradient.device)
-                        == target_node.token_position
-                    )[:, None]
-                )
-            if not isinstance(target_node, OutputNode):
-                gradient = gradient * self.cache.mlp_outputs[max_layer].ln_factor
+            if isinstance(target_node, OutputNode):
+                gradient = target_node.input_vector
+                target_graph_node = self.cache.last_layer_activations[0, target_node.token_position]
+                max_mlp_layer = self.model.num_layers
+            elif isinstance(target_node, IntermediateNode):
+                target_graph_node = self.cache.mlp_outputs[max_layer].activation[0, target_node.token_position]
+                gradient = self.cache.mlp_outputs[max_layer].location[0, target_node.token_position] == target_node.feature_index
+                max_mlp_layer = max_layer
             else:
-                gradient = gradient.unsqueeze(0)
-        all_mlp_contributions = {}
-        past_gradients = {}
-        with measure_time(
-            f"Computing MLP contributions of node {target_node.id}",
-            disabled=True,
-        ):
-            for layer in tqdm(
-                range(min(max_layer, self.model.num_layers - 1), -1, -1),
-                desc=f"Computing MLP contributions of node {target_node.id}",
-                disable=True,
-            ):
-                start_gradient = gradient.clone()
-                if layer != max_layer:
-                    # pass skip gradient (just after the MLP) to the previous layer
-                    past_gradients[layer] = start_gradient
+                raise ValueError
 
-                    # find MLP sources on the current layer
-                    mlp_contributions = self.mlp_contribution(gradient, layer)
-                    for k, v in mlp_contributions.items():
-                        if k in all_mlp_contributions:
-                            all_mlp_contributions[k].contribution += v.contribution
-                        else:
-                            all_mlp_contributions[k] = v
+        backward_to = [self.cache.first_layer_activations] + [
+            node
+            for i in range(max_mlp_layer)
+            for node in (
+                self.cache.mlp_outputs[i].source_activation,
+                self.cache.mlp_outputs[i].source_error,
+            )
+        ]
+        gradients = torch.autograd.grad(
+            [target_graph_node],
+            backward_to,
+            [gradient],
+            retain_graph=True,
+        )
 
-                    # process skip weights from future layers
-                    skipped = 0
-                    to_delete = set()
-                    for target_layer, grad in past_gradients.items():
-                        try:
-                            skipped += grad @ self.model.w_skip(layer, target_layer)
-                        except IndexError:
-                            try:
-                                self.model.w_dec(layer, target_layer)
-                            except IndexError:
-                                to_delete.add(target_layer)
-                    for target_layer in to_delete:
-                        del past_gradients[target_layer]
-                    skipped = skipped * self.cache.mlp_outputs[layer].ln_factor
-                    gradient = gradient + skipped
+        all_contributions = []
 
-                if self.model.parallel_attn:
-                    gradient += self.attn_backward(start_gradient, layer)
-                else:
-                    gradient += self.attn_backward(gradient, layer)
+        with torch.no_grad():
+            for seq_idx in range(target_node.token_position + 1):
+                contribution = gradients[0][0, seq_idx] @ backward_to[0][0, seq_idx]
+                input_node_name = f"input_{seq_idx}"
+                all_contributions.append(Contribution(
+                    source=self.nodes[input_node_name],
+                    target=target_node,
+                    contribution=contribution.cpu(),
+                ))
+        for layer_idx in range(max_mlp_layer):
+            mlp_index = 1 + layer_idx * 2
+            error_index = mlp_index + 1
+            error_grad, error_val = gradients[error_index], backward_to[error_index]
+            # TODO what to do with BOS?
+            true_seq_len = self.cache.mlp_outputs[layer_idx].error.shape[1]
+            error_grad = error_grad[:, -true_seq_len:]
+            error_val = error_val[:, -true_seq_len:]
 
-        all_contributions = list(all_mlp_contributions.values())
-        with measure_time(
-            f"Computing embedding contributions of node {target_node.id}",
-            disabled=True,
-        ):
-            # embedding contribution
-            for preceding_position in range(0, target_node.token_position + 1):
-                embed_node = [
-                    node
-                    for node in self.nodes_by_layer_and_token[0][preceding_position]
-                    if isinstance(node, InputNode)
-                ][0]
-                contribution = torch.dot(
-                    gradient[0, preceding_position, :].float(), embed_node.output_vector.float()
-                ).item()
-                embedding_contribution = Contribution(
-                    source=embed_node, target=target_node, contribution=contribution
-                )
+            for seq_idx in range(target_node.token_position + 1):
+                error_contribution = error_grad[0, seq_idx] @ error_val[0, seq_idx]
+                all_contributions.append(Contribution(
+                    source=self.nodes[f"error_{seq_idx}_{layer_idx}"],
+                    target=target_node,
+                    contribution=error_contribution.cpu(),
+                ))
 
-                all_contributions.append(embedding_contribution)
+            mlp_grad = gradients[mlp_index]
+            mlp_grad = mlp_grad[:, -true_seq_len:]
+            mlp_grad_values, mlp_grad_indices = mlp_grad.flatten().topk(self.config.top_k_edges)
+            mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[:, -true_seq_len:].flatten()[mlp_grad_indices]
+            for grad_val, grad_idx, feature_idx in zip(mlp_grad_values.tolist(), mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
+                seq_idx = int(grad_idx // mlp_grad.shape[-1])
+                all_contributions.append(Contribution(
+                    source=self.nodes[f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"],
+                    target=target_node,
+                    contribution=grad_val,
+                ))
 
         with measure_time(
             f"Summarizing contributions of node {target_node.id}",
@@ -712,7 +619,7 @@ class AttributionGraph:
                     edge = Edge(
                         source=new_source,
                         target=target_node,
-                        weight=weight,
+                        weight=float(weight),
                     )
                     self.edges[edge.id] = edge
                     # if path ends with input node or error node, it is finished and we don't want to add it to the queue
