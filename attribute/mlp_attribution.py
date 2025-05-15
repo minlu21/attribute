@@ -12,7 +12,6 @@ from delphi.config import ConstructorConfig, SamplerConfig
 from delphi.latents import LatentDataset
 from loguru import logger
 from natsort import natsorted
-from torch import Tensor
 from tqdm.auto import tqdm, trange
 
 from .caching import TranscodedModel, TranscodedOutputs
@@ -482,36 +481,6 @@ class AttributionGraph:
         self.queue = NodeQueue()
         self.remaining_output_nodes = output_nodes.copy()
 
-    def attn_backward(
-        self,
-        # batch size, seq_len, d_model
-        vector: Tensor,
-        layer_index: int,
-    ):
-        # batch size, n_heads, seq_len, seq_len
-        attention_pattern = self.cache.attn_outputs[layer_index].attn_patterns
-        # d_model n_heads d_head
-        wO = self.model.attn_output(layer_index).to(
-            attention_pattern.device
-        )
-        # batch size, n_heads, seq_len, d_head
-        attn_post_value_gradient = torch.einsum("b s d, d h v -> b h s v", vector, wO)
-        # batch size, n_heads, seq_len, d_head
-        attn_pre_value_gradient = torch.einsum(
-            "b h y v, b h y x -> b h x v", attn_post_value_gradient, attention_pattern
-        )
-
-        wV = self.model.attn_value(layer_index).to(
-            attention_pattern.device
-        )
-        # batch size, seq_len, d_model
-        attn_pre_proj_gradient = torch.einsum(
-            "b h s v, h v d -> b s d", attn_pre_value_gradient, wV
-        )
-        attn_pre_proj_gradient = attn_pre_proj_gradient * self.cache.attn_outputs[layer_index].ln_factor
-
-        return attn_pre_proj_gradient
-
     @torch.autocast("cuda")
     def flow_once(self):
         with measure_time(
@@ -532,11 +501,15 @@ class AttributionGraph:
                 logger.debug(f"Doing target: {target_node.id} with influence {influence}")
                 logger.debug("Path:", [(x.source.id, x.weight) for x in target_elem.sequence])
 
+            true_seq_len = self.cache.mlp_outputs[0].error.shape[1]
+            fake_seq_len = self.cache.mlp_outputs[0].source_activation.shape[1]
+            offset = fake_seq_len - true_seq_len
+
             # compute all the contributions
             max_layer = target_node.layer_index
             if isinstance(target_node, OutputNode):
                 gradient = target_node.input_vector
-                target_graph_node = self.cache.last_layer_activations[0, target_node.token_position]
+                target_graph_node = self.cache.last_layer_activations[0, target_node.token_position + offset]
                 max_mlp_layer = self.model.num_layers
             elif isinstance(target_node, IntermediateNode):
                 target_graph_node = self.cache.mlp_outputs[max_layer].activation[0, target_node.token_position]
@@ -564,7 +537,7 @@ class AttributionGraph:
 
         with torch.no_grad():
             for seq_idx in range(target_node.token_position + 1):
-                contribution = gradients[0][0, seq_idx] @ backward_to[0][0, seq_idx]
+                contribution = gradients[0][0, seq_idx + offset] @ backward_to[0][0, seq_idx + offset]
                 input_node_name = f"input_{seq_idx}"
                 all_contributions.append(Contribution(
                     source=self.nodes[input_node_name],
@@ -575,13 +548,9 @@ class AttributionGraph:
             mlp_index = 1 + layer_idx * 2
             error_index = mlp_index + 1
             error_grad, error_val = gradients[error_index], backward_to[error_index]
-            # TODO what to do with BOS?
-            true_seq_len = self.cache.mlp_outputs[layer_idx].error.shape[1]
-            error_grad = error_grad[:, -true_seq_len:]
-            error_val = error_val[:, -true_seq_len:]
 
             for seq_idx in range(target_node.token_position + 1):
-                error_contribution = error_grad[0, seq_idx] @ error_val[0, seq_idx]
+                error_contribution = error_grad[0, seq_idx + offset] @ error_val[0, seq_idx + offset]
                 all_contributions.append(Contribution(
                     source=self.nodes[f"error_{seq_idx}_{layer_idx}"],
                     target=target_node,

@@ -219,6 +219,7 @@ class TranscodedModel(object):
                 out = v(
                     None,
                     addition=(0 if k != module_name else sae_out) / divide_by,
+                    no_extras=k != module_name,
                 )
                 if k == module_name:
                     sae_out = out.sae_out
