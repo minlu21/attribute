@@ -41,7 +41,7 @@ class AttributionConfig:
     top_k_edges: int = 128
 
     # always keep nodes above this threshold of influence
-    node_threshold = 1e-3
+    node_threshold = 5e-4
     # keep per_layer_position nodes above this threshold for each layer/position pair
     secondary_threshold = 1e-5
     per_layer_position = 0
@@ -88,7 +88,7 @@ class AttributionGraph:
     def logits(self):
         return self.cache.logits[0]
 
-    def adjacency_matrix(self, normalize: bool = True, absolute: bool = True, use_activation: bool = True):
+    def adjacency_matrix(self, normalize: bool = True, absolute: bool = True):
         logger.info("Deduplicating nodes")
         dedup_node_names = set()
         for edge in self.edges.values():
@@ -106,8 +106,6 @@ class AttributionGraph:
             target_index = dedup_node_indices[edge.target.id]
             source_index = dedup_node_indices[edge.source.id]
             weight = edge.weight
-            if not use_activation and isinstance(edge.source, IntermediateNode):
-                weight /= edge.source.activation
             if absolute:
                 weight = abs(weight)
             adj_matrix[target_index, source_index] = weight
@@ -121,7 +119,7 @@ class AttributionGraph:
         save_dir = Path(save_dir)
         logger.info("Saving graph to", save_dir)
 
-        adj_matrix, dedup_node_names = self.adjacency_matrix()
+        adj_matrix, dedup_node_names = self.adjacency_matrix(absolute=True, normalize=True)
         dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
 
         n_initial = len(dedup_node_names)
@@ -151,9 +149,9 @@ class AttributionGraph:
         else:
             influence = self.influence
 
-        influence = influence * activation_sources
+        influence = np.abs(influence) * activation_sources
         influence = influence / np.maximum(1e-2, influence.sum(axis=1, keepdims=True))
-        adj_matrix = adj_matrix * activation_sources
+        adj_matrix = np.abs(adj_matrix) * activation_sources
         adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
 
         total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
@@ -292,6 +290,7 @@ class AttributionGraph:
                 dead_features.add((layer, feature))
                 module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
+        module_latents = {k: v[torch.argsort(v)] for k, v in module_latents.items()}
 
         ds = LatentDataset(
             cache_path,
@@ -306,6 +305,9 @@ class AttributionGraph:
 
         bar = tqdm(total=sum(map(len, module_latents.values())))
         def process_feature(feature):
+            bar.update(1)
+            bar.refresh()
+            return
             layer_idx = int(feature.latent.module_name.split(".")[-2])
             feature_idx = feature.latent.latent_index
             dead_features.discard((layer_idx, feature_idx))
@@ -559,14 +561,15 @@ class AttributionGraph:
 
             mlp_grad = gradients[mlp_index]
             mlp_grad = mlp_grad[:, -true_seq_len:]
-            mlp_grad_values, mlp_grad_indices = mlp_grad.flatten().topk(self.config.top_k_edges)
+            _, mlp_grad_indices = (mlp_grad * (mlp_grad > self.config.pre_filter_threshold)).abs().flatten().topk(self.config.top_k_edges)
             mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[:, -true_seq_len:].flatten()[mlp_grad_indices]
-            for grad_val, grad_idx, feature_idx in zip(mlp_grad_values.tolist(), mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
+            mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
+            for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
                 seq_idx = int(grad_idx // mlp_grad.shape[-1])
                 all_contributions.append(Contribution(
                     source=self.nodes[f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"],
                     target=target_node,
-                    contribution=grad_val,
+                    contribution=grad_val.cpu(),
                 ))
 
         with measure_time(
