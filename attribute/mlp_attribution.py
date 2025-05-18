@@ -290,6 +290,7 @@ class AttributionGraph:
                 dead_features.add((layer, feature))
                 module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
+        module_latents = {k: v[torch.argsort(v)] for k, v in module_latents.items()}
 
         ds = LatentDataset(
             cache_path,
@@ -304,6 +305,9 @@ class AttributionGraph:
 
         bar = tqdm(total=sum(map(len, module_latents.values())))
         def process_feature(feature):
+            bar.update(1)
+            bar.refresh()
+            return
             layer_idx = int(feature.latent.module_name.split(".")[-2])
             feature_idx = feature.latent.latent_index
             dead_features.discard((layer_idx, feature_idx))

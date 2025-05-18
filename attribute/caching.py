@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import torch
 from jaxtyping import Array, Float, Int
-from sparsify import SparseCoder
+from sparsify import SparseCoder, CrossLayerRunner
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
@@ -175,7 +175,7 @@ class TranscodedModel(object):
         for hookpoint in self.hookpoints_ln:
             self.name_to_module[hookpoint].register_forward_hook(partial(ln_record_hook, save_dict=second_ln))
 
-        transcoder_outputs = {}
+        runner = CrossLayerRunner()
         target_transcoder_activations = {}
         source_transcoder_activations = {}
         transcoder_locations = {}
@@ -191,7 +191,7 @@ class TranscodedModel(object):
             batch_dims = input.shape[:-1]
             input = input.view(-1, input.shape[-1])
             # have to normalize input
-            transcoder_acts = transcoder(input, return_mid_decoder=True)
+            transcoder_acts = runner.encode(input, transcoder)
 
             target_latent_acts = transcoder_acts.latent_acts.clone().unflatten(0, batch_dims)
             source_latent_acts = transcoder_acts.latent_acts
@@ -201,6 +201,9 @@ class TranscodedModel(object):
             flat_source_acts = source_latent_acts.flatten(0, -2)
             transcoder_acts.latent_acts = flat_source_acts
 
+            outputs = runner.decode(transcoder_acts, None, module_name)
+            sae_out = outputs.sae_out
+
             layer_idx = self.name_to_index[module_name]
             masked_features = mask_features.get(layer_idx, [])
             if masked_features:
@@ -209,26 +212,6 @@ class TranscodedModel(object):
                 # TODO: when patching, we can't use automatic attribution
                 transcoder_acts.latent_acts = acts * (1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float())
 
-            transcoder_outputs[module_name] = transcoder_acts
-
-            sae_out = 0
-            to_delete = set()
-            for k, v in transcoder_outputs.items():
-                # divide_by = max(1, len(transcoder_outputs) - 1)
-                divide_by = 1
-                out = v(
-                    None,
-                    addition=(0 if k != module_name else sae_out) / divide_by,
-                    no_extras=k != module_name,
-                )
-                if k == module_name:
-                    sae_out = out.sae_out
-                else:
-                    sae_out += out.sae_out
-                if out.is_last:
-                    to_delete.add(k)
-            for k in to_delete:
-                del transcoder_outputs[k]
             # have to reshape output to get the batch dimension back
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
@@ -275,6 +258,8 @@ class TranscodedModel(object):
         last_layer_activations = outputs.hidden_states[-1]
         if last_layer_activations.requires_grad:
             last_layer_activations.retain_grad()
+
+        runner.reset()
 
         mlp_outputs = {}
         for i in range(self.num_layers):
