@@ -40,6 +40,7 @@ def load_artifacts(run_cfg: RunConfig):
         torch_dtype=dtype,
         token=run_cfg.hf_token,
     )
+    model.to("cuda")
     hookpoint_to_sparse_encode, transcode = load_hooks_sparse_coders(
         model,
         run_cfg,

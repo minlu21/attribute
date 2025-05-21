@@ -1,6 +1,7 @@
 # Evaluation script for measuring model performance on next token prediction
 # Calculates token-level accuracy and KL divergence between predicted and true distributions
 import argparse
+import itertools
 import json
 from datetime import datetime
 from pathlib import Path
@@ -33,10 +34,12 @@ def parse_args():
                       help='Fix MLP L0 to this value')
     parser.add_argument('--output_path', type=str, default="results/accuracy",
                       help='Directory to save results')
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=256,
                       help='Batch size for evaluation')
-    parser.add_argument('--max_seq_len', type=int, default=128,
+    parser.add_argument('--max_seq_len', type=int, default=64,
                       help='Maximum sequence length for evaluation')
+    parser.add_argument('--max_steps', type=int, default=128,
+                      help='Maximum number of steps for evaluation')
     return parser.parse_args()
 
 def main():
@@ -79,7 +82,10 @@ def main():
 
     # Evaluate on full dataset
     try:
-        for batch in (bar := tqdm(dataloader, desc="Evaluating")):
+        if args.max_steps is not None:
+            dataloader = itertools.islice(dataloader, args.max_steps)
+        bar = tqdm(dataloader, desc="Evaluating", total=args.max_steps)
+        for batch in bar:
             input_ids = batch["input_ids"].to(model.device)
             with torch.no_grad():
                 out_base = model.model(input_ids)

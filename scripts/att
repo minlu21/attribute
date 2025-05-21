@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+uv run python -m attribute --model_name="gpt2" \
+--transcoder_path="../e2e/checkpoints/clt-gpt2/coal-per-k8" \
+--cache_path=results/transcoder_gpt2_128x_coal_per_k8_v0/latents \
+--name "ndag-gpt2" \
+--scan "gpt2-128x-coal-per-k8-v0" \
+--remove_bos True \
+"<|endoftext|>The National Digital Analytics Group ("
+exit
+
 uv run python -m attribute --model_name="nev/GELU_4L512W_C4_Code" \
 --transcoder_path="../e2e/checkpoints/gelu-4l-clt/ef128k64" \
 --cache_path=results/transcoder_gelu4l_x128k64-0/latents \

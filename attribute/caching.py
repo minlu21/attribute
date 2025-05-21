@@ -30,6 +30,7 @@ class MLPOutputs:
     location: Int[Array, "batch seq_len k"]
     error: Float[Array, "batch seq_len hidden_size"]
     source_error: Float[Array, "batch seq_len hidden_size"]
+    l0: float
 
 
 @dataclass
@@ -72,6 +73,7 @@ class TranscodedModel(object):
             torch_dtype=torch.bfloat16,
             attn_implementation="eager",
         )
+        model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = model
         self.tokenizer = tokenizer
@@ -178,6 +180,7 @@ class TranscodedModel(object):
         runner = CrossLayerRunner()
         target_transcoder_activations = {}
         source_transcoder_activations = {}
+        l0s = {}
         transcoder_locations = {}
         errors = {}
 
@@ -193,6 +196,8 @@ class TranscodedModel(object):
             # have to normalize input
             transcoder_acts = runner.encode(input, transcoder)
 
+            l0 = (transcoder_acts.latent_acts != 0).float().sum(dim=-1).mean().item()
+            l0s[module_name] = l0
             target_latent_acts = transcoder_acts.latent_acts.clone().unflatten(0, batch_dims)
             source_latent_acts = transcoder_acts.latent_acts
             source_latent_acts = source_latent_acts.unflatten(0, batch_dims).clone()
@@ -270,6 +275,7 @@ class TranscodedModel(object):
                 location=transcoder_locations[self.hookpoints_mlp[i]],
                 error=errors[self.hookpoints_mlp[i]],
                 source_error=errors[self.hookpoints_mlp[i]],
+                l0=l0s[self.hookpoints_mlp[i]],
             )
         attn_outputs = {}
         for i in range(self.num_layers):

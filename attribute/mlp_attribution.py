@@ -561,7 +561,8 @@ class AttributionGraph:
 
             mlp_grad = gradients[mlp_index]
             mlp_grad = mlp_grad[:, -true_seq_len:]
-            _, mlp_grad_indices = (mlp_grad * (mlp_grad > self.config.pre_filter_threshold)).abs().flatten().topk(self.config.top_k_edges)
+            edges = (mlp_grad * (mlp_grad > self.config.pre_filter_threshold)).abs().flatten()
+            _, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
             mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[:, -true_seq_len:].flatten()[mlp_grad_indices]
             mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
             for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
