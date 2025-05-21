@@ -12,10 +12,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
 from transformers.models.gpt2 import GPT2PreTrainedModel
+from transformers.models.qwen2 import Qwen2PreTrainedModel
 from loguru import logger
 
 
-
+LlamaLike = LlamaPreTrainedModel | Qwen2PreTrainedModel
 GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 
 
@@ -48,6 +49,7 @@ class TranscodedOutputs:
 
 
 class TranscodedModel(object):
+    @torch.no_grad()
     def __init__(
         self,
         model_name: str | os.PathLike,
@@ -71,7 +73,7 @@ class TranscodedModel(object):
             return
         if hookpoint_fn is None:
             def hookpoint_fn(hookpoint):
-                if isinstance(model, LlamaPreTrainedModel):
+                if isinstance(model, LlamaLike):
                     return hookpoint.replace("model.layers.", "layers.")
                 elif isinstance(model, GPT2Like):
                     return hookpoint.replace("transformer.h.", "h.")
@@ -86,10 +88,18 @@ class TranscodedModel(object):
         transcoder_path = Path(transcoder_path)
         self.transcoders = {}
         for hookpoint, temp_hookpoint in zip(self.hookpoints_mlp, self.temp_hookpoints_mlp):
-            sae = SparseCoder.load_from_disk(
-                transcoder_path / temp_hookpoint,
-                device=device,
-            )
+            if not transcoder_path.joinpath(temp_hookpoint).exists():
+                sae = SparseCoder.load_from_hub(
+                    str(transcoder_path),
+                    temp_hookpoint,
+                    device=device,
+                )
+            else:
+                sae = SparseCoder.load_from_disk(
+                    transcoder_path / temp_hookpoint,
+                    device=device,
+                )
+            sae.requires_grad_(False)
             self.transcoders[hookpoint] = sae
         self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
         self.hookpoints_ln = [f"{self.layer_prefix}.{i}.{self.mlp_layernorm_name}" for i in range(self.num_layers)]
@@ -133,10 +143,10 @@ class TranscodedModel(object):
         def ln_record_hook(module, input, output, save_dict=None):
             mean = input[0].mean(dim=-1, keepdim=True).detach()
             var = input[0].var(dim=-1, keepdim=True)
-            multiplier = (1 / torch.sqrt(var + module.eps).detach()) * module.weight
+            multiplier = (1 / torch.sqrt(var + getattr(module, "eps", 1e-5)).detach()) * module.weight
             if save_dict is not None:
                 save_dict[self.module_to_name[module]] = multiplier
-            return (input[0] - mean) * multiplier + module.bias
+            return (input[0] - mean) * multiplier + getattr(module, "bias", 0)
 
         for hookpoint in self.hookpoints_layer:
             ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
@@ -259,7 +269,7 @@ class TranscodedModel(object):
 
     @property
     def layer_prefix(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return "model.layers"
         elif isinstance(self.model, GPT2Like):
             return "transformer.h"
@@ -268,7 +278,7 @@ class TranscodedModel(object):
 
     @property
     def attn_layernorm_name(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return "input_layernorm"
         elif isinstance(self.model, GPT2Like):
             return "ln_1"
@@ -277,7 +287,7 @@ class TranscodedModel(object):
 
     @property
     def mlp_layernorm_name(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return "post_attention_layernorm"
         elif isinstance(self.model, GPT2Like):
             return "ln_2"
@@ -293,7 +303,7 @@ class TranscodedModel(object):
 
     @property
     def embedding_weight(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return self.model.model.embed_tokens.weight
         elif isinstance(self.model, GPT2Like):
             return self.model.transformer.wte.weight
@@ -306,7 +316,7 @@ class TranscodedModel(object):
 
     @property
     def final_ln(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return self.model.model.norm
         elif isinstance(self.model, GPT2Like):
             return self.model.transformer.ln_f
@@ -315,7 +325,7 @@ class TranscodedModel(object):
 
     @property
     def logit_weight(self):
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return self.model.lm_head.weight * self.final_ln.weight
         elif isinstance(self.model, GPT2Like):
             return self.model.lm_head.weight * self.final_ln.weight
@@ -327,7 +337,9 @@ class TranscodedModel(object):
         bias = self.model.lm_head.bias
         if bias is None:
             bias = 0
-        return bias + self.logit_weight @ self.final_ln.bias
+        if hasattr(self.final_ln, "bias"):
+            bias = bias + self.logit_weight @ self.final_ln.bias
+        return bias
 
     @property
     def vocab_size(self):
@@ -407,7 +419,7 @@ class TranscodedModel(object):
 
     def attn(self, layer_idx: int) -> torch.nn.Module:
         layer = self.model.get_submodule(self.layer_prefix)[layer_idx]
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             return layer.self_attn
         elif isinstance(self.model, GPTNeoPreTrainedModel):
             return layer.attn.attention
@@ -417,7 +429,7 @@ class TranscodedModel(object):
             raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     def attn_output(self, layer_idx: int) -> Float[Array, "hidden_size num_attention_heads head_dim"]:
-        if isinstance(self.model, LlamaPreTrainedModel):
+        if isinstance(self.model, LlamaLike):
             w_o = self.attn(layer_idx).o_proj.weight
         elif isinstance(self.model, GPTNeoPreTrainedModel):
             w_o = self.attn(layer_idx).out_proj.weight
@@ -447,7 +459,7 @@ class TranscodedModel(object):
     def attn_q_slice(self, layer_idx: int):
         if isinstance(self.model, GPT2PreTrainedModel):
             return self.attn(layer_idx).c_attn, 0, self.hidden_size
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, (GPTNeoPreTrainedModel, LlamaLike)):
             return self.attn(layer_idx).q_proj, 0, self.hidden_size
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
@@ -455,7 +467,7 @@ class TranscodedModel(object):
     def attn_k_slice(self, layer_idx: int):
         if isinstance(self.model, GPT2PreTrainedModel):
             return self.attn(layer_idx).c_attn, self.hidden_size, self.hidden_size * 2
-        elif isinstance(self.model, GPTNeoPreTrainedModel):
+        elif isinstance(self.model, (GPTNeoPreTrainedModel, LlamaLike)):
             return self.attn(layer_idx).k_proj, 0, self.hidden_size
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")

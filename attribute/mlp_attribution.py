@@ -28,7 +28,7 @@ class AttributionConfig:
     scan: str
 
     # how many target nodes to compute contributions for
-    flow_steps: int = 2000
+    flow_steps: int = 500
     # whether to use the softmax gradient for the output node
     # instead of the logit
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
@@ -268,6 +268,7 @@ class AttributionGraph:
         )
 
         graph_data_dir = save_dir / "graph_data"
+        graph_data_dir.mkdir(parents=True, exist_ok=True)
         circuit_path = graph_data_dir / f"{self.config.name}.json"
         open(circuit_path, "w").write(json.dumps(result))
 
@@ -279,6 +280,7 @@ class AttributionGraph:
             if save_file.stem == self.config.name:
                 own_file_index = i
         metadatas[0], metadatas[own_file_index] = metadatas[own_file_index], metadatas[0]
+        (save_dir / "data").mkdir(parents=True, exist_ok=True)
         open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=metadatas)))
 
     async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
@@ -305,9 +307,6 @@ class AttributionGraph:
 
         bar = tqdm(total=sum(map(len, module_latents.values())))
         def process_feature(feature):
-            bar.update(1)
-            bar.refresh()
-            return
             layer_idx = int(feature.latent.module_name.split(".")[-2])
             feature_idx = feature.latent.latent_index
             dead_features.discard((layer_idx, feature_idx))
