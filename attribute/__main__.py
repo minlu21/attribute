@@ -42,10 +42,7 @@ async def main(
             mlp_output.activation = mlp_output.activation[:, 1:]
             mlp_output.location = mlp_output.location[:, 1:]
             mlp_output.error = mlp_output.error[:, 1:]
-        for k, attn_output in transcoded_outputs.attn_outputs.items():
-            attn_output.ln_factor = attn_output.ln_factor[:, 1:]
-            attn_output.attn_values = attn_output.attn_values[:, :, 1:]
-            attn_output.attn_patterns = attn_output.attn_patterns[:, :, 1:, 1:]
+            # we don't remove BOS from source nodes because we take gradients to them
 
     attribution_graph = AttributionGraph(model, transcoded_outputs, config)
     attribution_graph.flow()

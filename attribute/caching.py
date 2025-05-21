@@ -12,11 +12,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
 from transformers.models.gpt2 import GPT2PreTrainedModel
-from transformers.models.gpt2.modeling_gpt2 import eager_attention_forward as gpt2_eager_attention_forward
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from loguru import logger
 
-from .utils import repeat_kv
 
 
 GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
@@ -34,16 +31,9 @@ class MLPOutputs:
 
 
 @dataclass
-class AttentionOutputs:
-    ln_factor: Float[Array, "batch seq_len hidden_size"]
-    attn_values: Float[Array, "batch num_attention_heads seq_len head_dim"]
-    attn_patterns: Float[Array, "batch num_attention_heads seq_len seq_len"]
-
-@dataclass
 class TranscodedOutputs:
     input_ids: Int[Array, "batch seq_len"]
     mlp_outputs: dict[int, MLPOutputs]
-    attn_outputs: dict[int, AttentionOutputs]
     last_layer_activations: Float[Array, "batch seq_len hidden_size"]
     first_layer_activations: Float[Array, "batch seq_len hidden_size"]
     logits: Float[Array, "batch seq_len vocab_size"]
@@ -71,7 +61,6 @@ class TranscodedModel(object):
             model_name,
             device_map={"": device},
             torch_dtype=torch.bfloat16,
-            attn_implementation="eager",
         )
         model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -141,36 +130,17 @@ class TranscodedModel(object):
             raise ValueError(f"Unsupported prompt type: {type(prompt)}")
         self.clear_hooks()
 
-        attn_values = {}
-        first_ln = {}
-
-        def ln_record_hook(module, input, output, save_dict):
+        def ln_record_hook(module, input, output, save_dict=None):
             mean = input[0].mean(dim=-1, keepdim=True).detach()
             var = input[0].var(dim=-1, keepdim=True)
             multiplier = (1 / torch.sqrt(var + module.eps).detach()) * module.weight
-            save_dict[self.module_to_name[module]] = multiplier
+            if save_dict is not None:
+                save_dict[self.module_to_name[module]] = multiplier
             return (input[0] - mean) * multiplier + module.bias
 
-
-        def get_attention_values_hook(module, input, output):
-            # this hook is in the layer
-            residual = input[0]
-            layer_name = self.module_to_name[module]
-            layer_normed = getattr(module, self.attn_layernorm_name)(residual)
-
-            # stuff related to attention
-            input_shape = layer_normed.shape[:-1]
-            hidden_shape = (*input_shape, -1, self.head_dim)
-
-            layer_idx = self.name_to_index[layer_name]
-            value_states = self.project_v(layer_idx, layer_normed).view(hidden_shape).transpose(1, 2)
-            values = repeat_kv(value_states, self.repeat_kv)
-            attn_values[layer_name] = values
-
         for hookpoint in self.hookpoints_layer:
-            self.name_to_module[hookpoint].register_forward_hook(get_attention_values_hook)
             ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
-            ln.register_forward_hook(partial(ln_record_hook, save_dict=first_ln))
+            ln.register_forward_hook(ln_record_hook)
             self.freeze_attention_pattern(hookpoint)
 
         second_ln = {}
@@ -246,10 +216,9 @@ class TranscodedModel(object):
 
         outputs = self.model(input_ids=tokenized_prompt.input_ids,
                             #  attention_mask=tokenized_prompt.attention_mask,
-                             output_attentions=True, output_hidden_states=True)
+                             output_hidden_states=True)
         self.clear_hooks()
 
-        attention_patterns = outputs.attentions
         logits = outputs.logits
 
         logger.info("Top last token logits:")
@@ -277,18 +246,10 @@ class TranscodedModel(object):
                 source_error=errors[self.hookpoints_mlp[i]],
                 l0=l0s[self.hookpoints_mlp[i]],
             )
-        attn_outputs = {}
-        for i in range(self.num_layers):
-            attn_outputs[i] = AttentionOutputs(
-                ln_factor=first_ln[self.hookpoints_attn_ln[i]],
-                attn_values=attn_values[self.hookpoints_layer[i]],
-                attn_patterns=attention_patterns[i],
-            )
 
         transcoded_outputs = TranscodedOutputs(
             input_ids=tokenized_prompt.input_ids,
             mlp_outputs=mlp_outputs,
-            attn_outputs=attn_outputs,
             first_layer_activations=first_layer_activations,
             last_layer_activations=last_layer_activations,
             logits=logits,
@@ -483,38 +444,35 @@ class TranscodedModel(object):
             q, k, v = torch.split(projected, self.hidden_size, dim=-1)
             return v
 
+    def attn_q_slice(self, layer_idx: int):
+        if isinstance(self.model, GPT2PreTrainedModel):
+            return self.attn(layer_idx).c_attn, 0, self.hidden_size
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return self.attn(layer_idx).q_proj, 0, self.hidden_size
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
+    def attn_k_slice(self, layer_idx: int):
+        if isinstance(self.model, GPT2PreTrainedModel):
+            return self.attn(layer_idx).c_attn, self.hidden_size, self.hidden_size * 2
+        elif isinstance(self.model, GPTNeoPreTrainedModel):
+            return self.attn(layer_idx).k_proj, 0, self.hidden_size
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
+
     def decode_token(self, token_id: int) -> str:
         return self.tokenizer.decode([token_id])
 
     def freeze_attention_pattern(self, hookpoint: str):
-        attn = self.attn(self.name_to_index[hookpoint])
-        original_implementation = attn.config._attn_implementation
-        if original_implementation.startswith("no_grad_"):
-            return
-        impl_name = original_implementation
-        if impl_name == "eager":
-            impl_name = f"eager_{type(attn).__name__}"
-        no_grad_name = "no_grad_" + impl_name
-        if no_grad_name not in ALL_ATTENTION_FUNCTIONS:
-            @torch.compile
-            def new_attention_forward(module, query, key, value, attention_mask, *, impl_fn, **kwargs):
-                query = query.detach()
-                key = key.detach()
-                _, attn_weights = impl_fn(module, query, key, value, attention_mask, **kwargs)
-                attn_weights = attn_weights.detach()
-
-                attn_output = torch.matmul(attn_weights, value)
-                attn_output = attn_output.transpose(1, 2)
-
-                return attn_output, attn_weights
-            if isinstance(self.model, GPT2PreTrainedModel):
-                eager_attention_forward = gpt2_eager_attention_forward
-            else:
-                raise ValueError(f"Unsupported model type: {type(self.model)}")
-            ALL_ATTENTION_FUNCTIONS[no_grad_name] = partial(
-                new_attention_forward,
-                impl_fn=
-                ALL_ATTENTION_FUNCTIONS[original_implementation]
-                if original_implementation != "eager"
-                else eager_attention_forward)
-        attn.config._attn_implementation = no_grad_name
+        index = self.name_to_index[hookpoint]
+        def freeze_slice(module, input, output, start, end):
+            if start == 0 and end == output.shape[-1]:
+                return output.detach()
+            indices = torch.arange(output.shape[-1], device=output.device)
+            mask = (indices >= start) & (indices < end)
+            output = torch.where(mask, output.detach(), output)
+            return output
+        for module, start, end in (self.attn_q_slice(index), self.attn_k_slice(index)):
+            module.register_forward_hook(partial(freeze_slice,
+                                                 start=torch.tensor(start, device=self.device),
+                                                 end=torch.tensor(end, device=self.device)))
