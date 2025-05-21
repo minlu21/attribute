@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
+# PROMPT_NAME="ndag-gpt2"
+# PROMPT_TEXT="<|endoftext|>The National Digital Analytics Group ("
+PROMPT_NAME="basketball-gpt2"
+PROMPT_TEXT="<|endoftext|>Michael Jordan plays the sport of"
 uv run python -m attribute --model_name="gpt2" \
---transcoder_path="../e2e/checkpoints/clt-gpt2/coal-per-k8" \
---cache_path=results/transcoder_gpt2_128x_coal_per_k8_v0/latents \
---name "ndag-gpt2" \
---scan "gpt2-128x-coal-per-k8-v0" \
+--transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/clt-gpt2/const-k16" \
+--cache_path=results/transcoder_gpt2_128x_const_k16_v0/latents \
+--name $PROMPT_NAME \
+--scan "gpt2-128x-const-k16-v0" \
 --remove_bos True \
-"<|endoftext|>The National Digital Analytics Group ("
+"$PROMPT_TEXT"
 exit
 
 uv run python -m attribute --model_name="nev/GELU_4L512W_C4_Code" \

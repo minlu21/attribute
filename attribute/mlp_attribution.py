@@ -34,9 +34,9 @@ class AttributionConfig:
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
 
     # remove MLP edges below this threshold
-    pre_filter_threshold: float = 1e-4
+    pre_filter_threshold: float = 1e-3
     # keep edges above this threshold
-    edge_threshold = 1e-4
+    edge_threshold = 1e-3
     # keep top k edges for each node
     top_k_edges: int = 128
 
@@ -561,7 +561,7 @@ class AttributionGraph:
 
             mlp_grad = gradients[mlp_index]
             mlp_grad = mlp_grad[:, -true_seq_len:]
-            edges = (mlp_grad * (mlp_grad > self.config.pre_filter_threshold)).abs().flatten()
+            edges = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs().flatten()
             _, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
             mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[:, -true_seq_len:].flatten()[mlp_grad_indices]
             mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
