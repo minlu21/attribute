@@ -21,6 +21,7 @@ dependencies = [
     "torch>=2.7.0",
     "pytorch-triton>=3.3.0",
     "transformers>=4.51.3",
+    "gradio>=5.30.0",
 ]
 
 [[tool.uv.index]]

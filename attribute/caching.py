@@ -47,6 +47,20 @@ class TranscodedOutputs:
     def batch_size(self):
         return self.input_ids.shape[0]
 
+    def remove_prefix(self, remove_prefix: int):
+        if remove_prefix > 0:
+            self.input_ids = self.input_ids[:, remove_prefix:]
+            # only ever accessed w/ [-1], removing BOS doesn't matter
+            # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
+            self.logits = self.logits[:, remove_prefix:]
+            for k, mlp_output in self.mlp_outputs.items():
+                mlp_output.ln_factor = mlp_output.ln_factor[:, remove_prefix:]
+                mlp_output.activation = mlp_output.activation[:, remove_prefix:]
+                mlp_output.location = mlp_output.location[:, remove_prefix:]
+                mlp_output.error = mlp_output.error[:, remove_prefix:]
+                assert mlp_output.location.shape[1] == self.input_ids.shape[1]
+                # we don't remove BOS from source nodes because we take gradients to them
+
 
 class TranscodedModel(object):
     @torch.no_grad()

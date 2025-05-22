@@ -295,10 +295,12 @@ class AttributionGraph:
         (save_dir / "data").mkdir(parents=True, exist_ok=True)
         open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=metadatas)))
 
+        return circuit_path
+
     def get_dense_features(self, cache_path: os.PathLike):
         cache_path = Path(cache_path)
         dense_features = set()
-        if not cache_path.exists() or not self.config.filter_high_freq_early:
+        if not cache_path.exists() or not (cache_path / "cfg.json").exists() or not self.config.filter_high_freq_early:
             logger.warning("Skipping dead feature detection because cache does not exist or filter_high_freq_early is 0")
             self.dense_features = dense_features
             return
@@ -541,7 +543,7 @@ class AttributionGraph:
             target_elems = self.queue.pop_n(self.config.batch_size)
             influences, target_nodes = [x.contribution for x in target_elems], [x.source for x in target_elems]
 
-        true_seq_len = self.cache.mlp_outputs[0].error.shape[1]
+        true_seq_len = self.cache.input_ids.shape[1]
         fake_seq_len = self.cache.mlp_outputs[0].source_activation.shape[1]
         offset = fake_seq_len - true_seq_len
 
@@ -557,7 +559,9 @@ class AttributionGraph:
             for batch_idx, target_node in enumerate(target_nodes):
                 if gradient is None:
                     gradient = torch.zeros_like(target_graph_node)
-                gradient[batch_idx, target_node.token_position] += self.cache.mlp_outputs[max_layer].location[batch_idx, target_node.token_position] == target_node.feature_index
+                gradient[batch_idx, -true_seq_len:][target_node.token_position] += \
+                    self.cache.mlp_outputs[max_layer].location[batch_idx, -true_seq_len:][target_node.token_position] \
+                        == target_node.feature_index
             max_mlp_layer = max_layer
         else:
             raise ValueError
@@ -583,7 +587,7 @@ class AttributionGraph:
             for batch_idx, (target_node, influence, target_elem) in enumerate(zip(target_nodes, influences, target_elems)):
                 all_contributions = []
                 for seq_idx in range(target_node.token_position + 1):
-                    contribution = gradients[0][batch_idx, seq_idx] @ backward_to[0][batch_idx, seq_idx + offset]
+                    contribution = gradients[0][batch_idx, -true_seq_len:][seq_idx] @ backward_to[0][batch_idx, -true_seq_len:][seq_idx]
                     input_node_name = f"input_{seq_idx}"
                     source = self.nodes[input_node_name]
                     assert source.token_position <= target_node.token_position, f"{source.token_position} <= {target_node.token_position}"
@@ -598,7 +602,7 @@ class AttributionGraph:
                     error_grad, error_val = gradients[error_index], backward_to[error_index]
 
                     for seq_idx in range(target_node.token_position + 1):
-                        error_contribution = error_grad[batch_idx, seq_idx + offset] @ error_val[batch_idx, seq_idx + offset]
+                        error_contribution = error_grad[batch_idx, -true_seq_len:][seq_idx] @ error_val[batch_idx, -true_seq_len:][seq_idx]
                         source = self.nodes[f"error_{seq_idx}_{layer_idx}"]
                         assert source.token_position <= target_node.token_position, f"{source.token_position} <= {target_node.token_position}"
                         all_contributions.append(Contribution(
@@ -607,23 +611,19 @@ class AttributionGraph:
                             contribution=error_contribution.to(device="cpu", non_blocking=True),
                         ))
 
-                    mlp_grad = gradients[mlp_index][batch_idx, offset:]
-                    # if isinstance(target_node, IntermediateNode):
-                    #     print(target_node.token_position)
-                    #     print(gradient.shape, mlp_grad.shape)
-                    #     print(gradient[batch_idx, target_node.token_position:])
-                    #     print(mlp_grad[target_node.token_position:])
+                    mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
                     edges = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs().flatten()
-                    _, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
-                    mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[batch_idx].flatten()[mlp_grad_indices]
+                    mlp_grad_values, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
+                    mlp_grad_indices = mlp_grad_indices[mlp_grad_values > self.config.pre_filter_threshold]
+                    mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[batch_idx, -true_seq_len:].flatten()[mlp_grad_indices]
                     mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
                     mlp_grad_indices, mlp_feature_indices = mlp_grad_indices.tolist(), mlp_feature_indices.tolist()
                     for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices, mlp_feature_indices):
                         seq_idx = int(grad_idx // mlp_grad.shape[-1])
-                        assert seq_idx <= target_node.token_position
                         node_name = (seq_idx, layer_idx, feature_idx)
                         if node_name in self.dense_features:
                             continue
+                        assert seq_idx <= target_node.token_position, f"{seq_idx} <= {target_node.token_position}"
                         assert self.intermediate_nodes[node_name].token_position <= target_node.token_position, f"{self.intermediate_nodes[node_name].token_position} <= {target_node.token_position}"
                         all_contributions.append(Contribution(
                             source=self.intermediate_nodes[node_name],

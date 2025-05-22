@@ -33,18 +33,7 @@ async def main(
         device="cuda",
     )
     transcoded_outputs = model([prompt] * config.batch_size)
-
-    if remove_prefix > 0:
-        transcoded_outputs.input_ids = transcoded_outputs.input_ids[:, remove_prefix:]
-        # only ever accessed w/ [-1], removing BOS doesn't matter
-        # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
-        transcoded_outputs.logits = transcoded_outputs.logits[:, remove_prefix:]
-        for k, mlp_output in transcoded_outputs.mlp_outputs.items():
-            mlp_output.ln_factor = mlp_output.ln_factor[:, remove_prefix:]
-            mlp_output.activation = mlp_output.activation[:, remove_prefix:]
-            mlp_output.location = mlp_output.location[:, remove_prefix:]
-            mlp_output.error = mlp_output.error[:, remove_prefix:]
-            # we don't remove BOS from source nodes because we take gradients to them
+    transcoded_outputs.remove_prefix(remove_prefix)
 
     attribution_graph = AttributionGraph(model, transcoded_outputs, config)
     attribution_graph.get_dense_features(cache_path)
