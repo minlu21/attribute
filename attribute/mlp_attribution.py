@@ -11,7 +11,6 @@ import torch
 from delphi.config import ConstructorConfig, SamplerConfig
 from delphi.latents import LatentDataset
 from loguru import logger
-from natsort import natsorted
 from tqdm.auto import tqdm, trange
 
 from .caching import TranscodedModel, TranscodedOutputs
@@ -32,6 +31,9 @@ class AttributionConfig:
     # whether to use the softmax gradient for the output node
     # instead of the logit
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
+
+    # remove features that are this dense
+    filter_high_freq_early: float = 0.01
 
     # remove MLP edges below this threshold
     pre_filter_threshold: float = 1e-3
@@ -114,6 +116,14 @@ class AttributionGraph:
 
         return adj_matrix, dedup_node_names
 
+    def make_latent_dataset(self, cache_path: os.PathLike, module_latents: dict[str, torch.Tensor]):
+        return LatentDataset(
+            cache_path,
+            SamplerConfig(n_examples_train=10, train_type="top", n_examples_test=0),
+            ConstructorConfig(center_examples=False, example_ctx_len=16, n_non_activating=0),
+            modules=list(module_latents.keys()) if module_latents else None,
+            latents=module_latents,
+        )
 
     def save_graph(self, save_dir: os.PathLike):
         save_dir = Path(save_dir)
@@ -283,6 +293,41 @@ class AttributionGraph:
         (save_dir / "data").mkdir(parents=True, exist_ok=True)
         open(save_dir / "data/graph-metadata.json", "w").write(json.dumps(dict(graphs=metadatas)))
 
+    def get_dense_features(self, cache_path: os.PathLike):
+        cache_path = Path(cache_path)
+        dense_features = set()
+        if not cache_path.exists() or not self.config.filter_high_freq_early:
+            logger.warning("Skipping dead feature detection because cache does not exist or filter_high_freq_early is 0")
+            self.dense_features = dense_features
+            return
+        dense_cache_path = cache_path.parent / "dense_features.json"
+        if dense_cache_path.exists():
+            dense = json.loads(dense_cache_path.read_text())
+        else:
+            dense = []
+            ds = self.make_latent_dataset(cache_path, None)
+            for buf in tqdm(ds.buffers, desc="Finding dense features"):
+                module = buf.module_path
+                all_features, _, all_tokens = buf.load()
+                all_features = all_features[..., 2]
+
+                # unique, counts = torch.unique(all_features, return_counts=True)
+                # freqs = counts / all_tokens.numel()
+                # too_high = freqs > self.config.filter_high_freq_early
+
+                all_tokens, all_features = all_tokens.numpy(), all_features.numpy()
+                unique, counts = np.unique(all_features, return_counts=True)
+                freqs = counts / all_tokens.size
+                too_high = freqs > self.config.filter_high_freq_early
+
+                # dead_features[module].extend(unique[too_high].tolist())
+                layer_idx = self.model.temp_hookpoints_mlp.index(module)
+                feature_names = [f"{layer_idx}_{feature}" for feature in unique[too_high].tolist()]
+                dense.extend(feature_names)
+            open(dense_cache_path, "w").write(json.dumps(dense))
+
+        self.dense_features = set(f"intermediate_{pos}_{feature}" for pos in range(self.seq_len) for feature in dense)
+
     async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
         module_latents = defaultdict(list)
         dead_features = set()
@@ -294,13 +339,7 @@ class AttributionGraph:
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
         module_latents = {k: v[torch.argsort(v)] for k, v in module_latents.items()}
 
-        ds = LatentDataset(
-            cache_path,
-            SamplerConfig(n_examples_train=10, train_type="top", n_examples_test=0),
-            ConstructorConfig(center_examples=False),
-            modules=natsorted(module_latents.keys()),
-            latents=module_latents,
-        )
+        ds = self.make_latent_dataset(cache_path, module_latents)
 
         logit_weight = self.model.logit_weight
         logit_bias = self.model.logit_bias
@@ -566,8 +605,11 @@ class AttributionGraph:
             mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
             for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
                 seq_idx = int(grad_idx // mlp_grad.shape[-1])
+                node_name = f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"
+                if node_name in self.dense_features:
+                    continue
                 all_contributions.append(Contribution(
-                    source=self.nodes[f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"],
+                    source=self.nodes[node_name],
                     target=target_node,
                     contribution=grad_val.cpu(),
                 ))

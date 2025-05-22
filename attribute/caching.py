@@ -128,7 +128,9 @@ class TranscodedModel(object):
             return 1
         return self.model.config.num_attention_heads // self.model.config.num_key_value_heads
 
-    def __call__(self, prompt: str | torch.Tensor, mask_features: dict[int, list[int]] = {},
+    def __call__(self, prompt: str | torch.Tensor,
+                 mask_features: dict[int, list[int]] = {},
+                 steer_features: dict[int, list[(int, int, float)]] = {},
                  errors_from: TranscodedOutputs | None = None,
                  no_error: bool = False) -> TranscodedOutputs:
         if isinstance(prompt, str):
@@ -191,12 +193,22 @@ class TranscodedModel(object):
 
             layer_idx = self.name_to_index[module_name]
             masked_features = mask_features.get(layer_idx, [])
+            steered_features = steer_features.get(layer_idx, [])
+            acts = transcoder_acts.latent_acts
+            indices = transcoder_acts.latent_indices
             if masked_features:
-                acts = transcoder_acts.latent_acts
-                indices = transcoder_acts.latent_indices
                 # TODO: when patching, we can't use automatic attribution
                 transcoder_acts.latent_acts = acts * (1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float())
-
+            if steered_features:
+                for seq_idx, feature, strength in steered_features:
+                    prev_activations = acts[0, seq_idx].tolist()
+                    if 0.0 not in prev_activations:
+                        acts = torch.nn.functional.pad(acts, (0, 1))
+                        indices = torch.nn.functional.pad(indices, (0, 1))
+                        acts[:, seq_idx, -1] = strength
+                        indices[:, seq_idx, -1] = feature
+                transcoder_acts.latent_acts = acts
+                transcoder_acts.latent_indices = indices
             # have to reshape output to get the batch dimension back
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
