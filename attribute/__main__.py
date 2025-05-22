@@ -45,7 +45,7 @@ async def main(
             # we don't remove BOS from source nodes because we take gradients to them
 
     attribution_graph = AttributionGraph(model, transcoded_outputs, config)
-    print(attribution_graph.get_dense_features(cache_path))
+    attribution_graph.get_dense_features(cache_path)
     attribution_graph.flow()
     attribution_graph.save_graph(save_dir)
     await attribution_graph.cache_features(cache_path, save_dir)

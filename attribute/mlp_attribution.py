@@ -521,6 +521,8 @@ class AttributionGraph:
         self.queue = NodeQueue()
         self.remaining_output_nodes = output_nodes.copy()
 
+        self.dead_features = set()
+
     @torch.autocast("cuda")
     def flow_once(self):
         with measure_time(

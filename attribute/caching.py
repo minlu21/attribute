@@ -178,6 +178,35 @@ class TranscodedModel(object):
             # have to normalize input
             transcoder_acts = runner.encode(input, transcoder)
 
+            layer_idx = self.name_to_index[module_name]
+            masked_features = mask_features.get(layer_idx, [])
+            steered_features = steer_features.get(layer_idx, [])
+            if masked_features:
+                acts = transcoder_acts.latent_acts
+                indices = transcoder_acts.latent_indices
+                # TODO: when patching, we can't use automatic attribution
+                transcoder_acts.latent_acts = acts * (1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float())
+            if steered_features:
+                acts = transcoder_acts.latent_acts
+                indices = transcoder_acts.latent_indices
+                acts = acts.view(*batch_dims, -1)
+                indices = indices.view(*batch_dims, -1)
+                for seq_idx, feature, strength in steered_features:
+                    prev_activations = acts[0, seq_idx].tolist()
+                    if 0.0 not in prev_activations:
+                        acts = torch.nn.functional.pad(acts, (0, 1))
+                        indices = torch.nn.functional.pad(indices, (0, 1))
+                        acts[:, seq_idx, -1] = strength
+                        indices[:, seq_idx, -1] = feature
+                    else:
+                        zero_index = prev_activations.index(0.0)
+                        acts[:, seq_idx, zero_index] = strength
+                        indices[:, seq_idx, zero_index] = feature
+                acts = acts.view(-1, acts.shape[-1])
+                indices = indices.view(-1, indices.shape[-1])
+                transcoder_acts.latent_acts = acts
+                transcoder_acts.latent_indices = indices
+
             l0 = (transcoder_acts.latent_acts != 0).float().sum(dim=-1).mean().item()
             l0s[module_name] = l0
             target_latent_acts = transcoder_acts.latent_acts.clone().unflatten(0, batch_dims)
@@ -191,24 +220,6 @@ class TranscodedModel(object):
             outputs = runner.decode(transcoder_acts, None, module_name)
             sae_out = outputs.sae_out
 
-            layer_idx = self.name_to_index[module_name]
-            masked_features = mask_features.get(layer_idx, [])
-            steered_features = steer_features.get(layer_idx, [])
-            acts = transcoder_acts.latent_acts
-            indices = transcoder_acts.latent_indices
-            if masked_features:
-                # TODO: when patching, we can't use automatic attribution
-                transcoder_acts.latent_acts = acts * (1 - torch.any(torch.stack([indices == i for i in masked_features], dim=0), dim=0).float())
-            if steered_features:
-                for seq_idx, feature, strength in steered_features:
-                    prev_activations = acts[0, seq_idx].tolist()
-                    if 0.0 not in prev_activations:
-                        acts = torch.nn.functional.pad(acts, (0, 1))
-                        indices = torch.nn.functional.pad(indices, (0, 1))
-                        acts[:, seq_idx, -1] = strength
-                        indices[:, seq_idx, -1] = feature
-                transcoder_acts.latent_acts = acts
-                transcoder_acts.latent_indices = indices
             # have to reshape output to get the batch dimension back
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
@@ -371,11 +382,16 @@ class TranscodedModel(object):
 
     @torch.no_grad()
     @torch.autocast("cuda")
-    def w_dec(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "features hidden_size"]:
+    def w_dec(self, layer_idx: int, target_layer_idx: int | None = None, use_skip: bool = False) -> Float[Array, "features hidden_size"]:
+        sparse_coder = self.transcoders[self.hookpoints_mlp[layer_idx]]
         try:
-            if target_layer_idx != layer_idx:
+            if target_layer_idx is not None and target_layer_idx != layer_idx:
                 raise AttributeError
-            return self.transcoders[self.hookpoints_mlp[layer_idx]].W_dec
+            w_dec = sparse_coder.W_dec.clone()
+            if use_skip:
+                for skip_layer_idx in range(layer_idx + 1, self.num_layers):
+                    w_dec += w_dec @ self.w_skip(skip_layer_idx, skip_layer_idx).T
+            return w_dec
         except AttributeError:
             if target_layer_idx is None:
                 logger.warning("Summing decoder weights because target_layer_idx is None")
