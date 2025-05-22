@@ -128,7 +128,7 @@ class TranscodedModel(object):
             return 1
         return self.model.config.num_attention_heads // self.model.config.num_key_value_heads
 
-    def __call__(self, prompt: str | torch.Tensor,
+    def __call__(self, prompt: str | list[str] | torch.Tensor,
                  mask_features: dict[int, list[int]] = {},
                  steer_features: dict[int, list[(int, int, float)]] = {},
                  errors_from: TranscodedOutputs | None = None,
@@ -136,6 +136,9 @@ class TranscodedModel(object):
         if isinstance(prompt, str):
             tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
             logger.info(f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt.input_ids[0]]}")
+        elif isinstance(prompt, list):
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            tokenized_prompt = self.tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
         elif isinstance(prompt, torch.Tensor):
             tokenized_prompt = SimpleNamespace(input_ids=prompt.to(self.device))
         else:

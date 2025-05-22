@@ -27,7 +27,9 @@ class AttributionConfig:
     scan: str
 
     # how many target nodes to compute contributions for
-    flow_steps: int = 500
+    flow_steps: int = 5000
+    # batch size for MLP attribution
+    batch_size: int = 8
     # whether to use the softmax gradient for the output node
     # instead of the logit
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
@@ -40,7 +42,7 @@ class AttributionConfig:
     # keep edges above this threshold
     edge_threshold = 1e-3
     # keep top k edges for each node
-    top_k_edges: int = 128
+    top_k_edges: int = 32
 
     # always keep nodes above this threshold of influence
     node_threshold = 5e-4
@@ -322,11 +324,11 @@ class AttributionGraph:
 
                 # dead_features[module].extend(unique[too_high].tolist())
                 layer_idx = self.model.temp_hookpoints_mlp.index(module)
-                feature_names = [f"{layer_idx}_{feature}" for feature in unique[too_high].tolist()]
+                feature_names = [[layer_idx, feature] for feature in unique[too_high].tolist()]
                 dense.extend(feature_names)
             open(dense_cache_path, "w").write(json.dumps(dense))
 
-        self.dense_features = set(f"intermediate_{pos}_{feature}" for pos in range(self.seq_len) for feature in dense)
+        self.dense_features = set((pos, *feature) for pos in range(self.seq_len) for feature in dense)
 
     async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
         module_latents = defaultdict(list)
@@ -408,7 +410,6 @@ class AttributionGraph:
     def initialize_graph(self):
         num_layers = self.num_layers
         logger.info(f"Initializing graph with {num_layers} layers")
-        assert self.cache.batch_size == 1, "Batch size >1 not supported"
         input_ids = self.input_ids
         seq_len = self.seq_len
         self.nodes_by_layer_and_token = {
@@ -431,6 +432,7 @@ class AttributionGraph:
             self.nodes_by_layer_and_token[0][i].append(input_node)
 
         self.activation_indices_tensors = {}
+        self.intermediate_nodes = {}
         # Create the intermediate nodes
         for layer, activations in self.cache.mlp_outputs.items():
             activations_tensor, indices_tensor = (
@@ -460,6 +462,7 @@ class AttributionGraph:
                     self.nodes_by_layer_and_token[layer][token_position].append(
                         intermediate_node
                     )
+                    self.intermediate_nodes[(token_position, layer, index)] = intermediate_node
                 # Create the error and skip nodes
                 error = activations.error[0, token_position]
                 error_node = ErrorNode(
@@ -525,40 +528,39 @@ class AttributionGraph:
 
     @torch.autocast("cuda")
     def flow_once(self):
-        with measure_time(
-            "Finding a node to compute contributions",
-            disabled=True,
-        ):
-            # if the queue is empty, get the output node with the highest probability
-            # TODO: handle the other output nodes
-            if len(self.output_nodes) > 0:
-                influence, target_node = 1, self.output_nodes.pop()
-                logger.debug("Starting from output node")
-                target_elem = None
-            else:
-                if len(self.queue) == 0:
-                    return False
-                target_elem = self.queue.pop()
-                influence, target_node = target_elem.contribution, target_elem.source
-                logger.debug(f"Doing target: {target_node.id} with influence {influence}")
-                logger.debug("Path:", [(x.source.id, x.weight) for x in target_elem.sequence])
+        gradient = 0
+        # if the queue is empty, get the output node with the highest probability
+        # TODO: handle the other output nodes
+        if len(self.output_nodes) > 0:
+            influences, target_nodes = [1], [self.output_nodes.pop()]
+            logger.debug("Starting from output node")
+            target_elems = [None]
+        else:
+            if len(self.queue) == 0:
+                return False
+            target_elems = self.queue.pop_n(self.config.batch_size)
+            influences, target_nodes = [x.contribution for x in target_elems], [x.source for x in target_elems]
 
-            true_seq_len = self.cache.mlp_outputs[0].error.shape[1]
-            fake_seq_len = self.cache.mlp_outputs[0].source_activation.shape[1]
-            offset = fake_seq_len - true_seq_len
+        true_seq_len = self.cache.mlp_outputs[0].error.shape[1]
+        fake_seq_len = self.cache.mlp_outputs[0].source_activation.shape[1]
+        offset = fake_seq_len - true_seq_len
 
-            # compute all the contributions
-            max_layer = target_node.layer_index
-            if isinstance(target_node, OutputNode):
-                gradient = target_node.input_vector
-                target_graph_node = self.cache.last_layer_activations[0, target_node.token_position + offset]
-                max_mlp_layer = self.model.num_layers
-            elif isinstance(target_node, IntermediateNode):
-                target_graph_node = self.cache.mlp_outputs[max_layer].activation[0, target_node.token_position]
-                gradient = self.cache.mlp_outputs[max_layer].location[0, target_node.token_position] == target_node.feature_index
-                max_mlp_layer = max_layer
-            else:
-                raise ValueError
+        # compute all the contributions
+        max_layer = target_nodes[0].layer_index
+        if isinstance(target_nodes[0], OutputNode):
+            gradient = target_nodes[0].input_vector
+            target_graph_node = self.cache.last_layer_activations[0, target_nodes[0].token_position + offset]
+            max_mlp_layer = self.model.num_layers
+        elif isinstance(target_nodes[0], IntermediateNode):
+            target_graph_node = self.cache.mlp_outputs[max_layer].activation
+            gradient = None
+            for batch_idx, target_node in enumerate(target_nodes):
+                if gradient is None:
+                    gradient = torch.zeros_like(target_graph_node)
+                gradient[batch_idx, target_node.token_position] += self.cache.mlp_outputs[max_layer].location[batch_idx, target_node.token_position] == target_node.feature_index
+            max_mlp_layer = max_layer
+        else:
+            raise ValueError
 
         backward_to = [self.cache.first_layer_activations] + [
             node
@@ -575,61 +577,65 @@ class AttributionGraph:
             retain_graph=True,
         )
 
-        all_contributions = []
+        new_sources = []
 
-        with torch.no_grad():
-            for seq_idx in range(target_node.token_position + 1):
-                contribution = gradients[0][0, seq_idx + offset] @ backward_to[0][0, seq_idx + offset]
-                input_node_name = f"input_{seq_idx}"
-                all_contributions.append(Contribution(
-                    source=self.nodes[input_node_name],
-                    target=target_node,
-                    contribution=contribution.cpu(),
-                ))
-        for layer_idx in range(max_mlp_layer):
-            mlp_index = 1 + layer_idx * 2
-            error_index = mlp_index + 1
-            error_grad, error_val = gradients[error_index], backward_to[error_index]
+        with measure_time("Summarizing contributions of node", disabled=True), torch.no_grad():
+            for batch_idx, (target_node, influence, target_elem) in enumerate(zip(target_nodes, influences, target_elems)):
+                all_contributions = []
+                for seq_idx in range(target_node.token_position + 1):
+                    contribution = gradients[0][batch_idx, seq_idx] @ backward_to[0][batch_idx, seq_idx + offset]
+                    input_node_name = f"input_{seq_idx}"
+                    source = self.nodes[input_node_name]
+                    assert source.token_position <= target_node.token_position, f"{source.token_position} <= {target_node.token_position}"
+                    all_contributions.append(Contribution(
+                        source=source,
+                        target=target_node,
+                        contribution=contribution.to(device="cpu", non_blocking=True),
+                    ))
+                for layer_idx in range(max_mlp_layer):
+                    mlp_index = 1 + layer_idx * 2
+                    error_index = mlp_index + 1
+                    error_grad, error_val = gradients[error_index], backward_to[error_index]
 
-            for seq_idx in range(target_node.token_position + 1):
-                error_contribution = error_grad[0, seq_idx + offset] @ error_val[0, seq_idx + offset]
-                all_contributions.append(Contribution(
-                    source=self.nodes[f"error_{seq_idx}_{layer_idx}"],
-                    target=target_node,
-                    contribution=error_contribution.cpu(),
-                ))
+                    for seq_idx in range(target_node.token_position + 1):
+                        error_contribution = error_grad[batch_idx, seq_idx + offset] @ error_val[batch_idx, seq_idx + offset]
+                        source = self.nodes[f"error_{seq_idx}_{layer_idx}"]
+                        assert source.token_position <= target_node.token_position, f"{source.token_position} <= {target_node.token_position}"
+                        all_contributions.append(Contribution(
+                            source=source,
+                            target=target_node,
+                            contribution=error_contribution.to(device="cpu", non_blocking=True),
+                        ))
 
-            mlp_grad = gradients[mlp_index]
-            mlp_grad = mlp_grad[:, -true_seq_len:]
-            edges = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs().flatten()
-            _, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
-            mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[:, -true_seq_len:].flatten()[mlp_grad_indices]
-            mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
-            for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices.tolist(), mlp_feature_indices.tolist()):
-                seq_idx = int(grad_idx // mlp_grad.shape[-1])
-                node_name = f"intermediate_{seq_idx}_{layer_idx}_{feature_idx}"
-                if node_name in self.dense_features:
-                    continue
-                all_contributions.append(Contribution(
-                    source=self.nodes[node_name],
-                    target=target_node,
-                    contribution=grad_val.cpu(),
-                ))
-
-        with measure_time(
-            f"Summarizing contributions of node {target_node.id}",
-            disabled=True,
-        ):
-            with measure_time(
-                f"Creating sources for {target_node.id}",
-                disabled=True,
-            ):
+                    mlp_grad = gradients[mlp_index][batch_idx, offset:]
+                    # if isinstance(target_node, IntermediateNode):
+                    #     print(target_node.token_position)
+                    #     print(gradient.shape, mlp_grad.shape)
+                    #     print(gradient[batch_idx, target_node.token_position:])
+                    #     print(mlp_grad[target_node.token_position:])
+                    edges = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs().flatten()
+                    _, mlp_grad_indices = edges.topk(min(self.config.top_k_edges, edges.shape[0]))
+                    mlp_feature_indices = self.cache.mlp_outputs[layer_idx].location[batch_idx].flatten()[mlp_grad_indices]
+                    mlp_grad_values = mlp_grad.flatten()[mlp_grad_indices]
+                    mlp_grad_indices, mlp_feature_indices = mlp_grad_indices.tolist(), mlp_feature_indices.tolist()
+                    for grad_val, grad_idx, feature_idx in zip(mlp_grad_values, mlp_grad_indices, mlp_feature_indices):
+                        seq_idx = int(grad_idx // mlp_grad.shape[-1])
+                        assert seq_idx <= target_node.token_position
+                        node_name = (seq_idx, layer_idx, feature_idx)
+                        if node_name in self.dense_features:
+                            continue
+                        assert self.intermediate_nodes[node_name].token_position <= target_node.token_position, f"{self.intermediate_nodes[node_name].token_position} <= {target_node.token_position}"
+                        all_contributions.append(Contribution(
+                            source=self.intermediate_nodes[node_name],
+                            target=target_node,
+                            contribution=grad_val.to(device="cpu", non_blocking=True),
+                        ))
                 # Make new paths using the last path
-                new_sources = []
                 for n_path in range(0, len(all_contributions)):
                     new_contribution = all_contributions[n_path]
                     new_source = new_contribution.source
-                    weight = new_contribution.contribution
+                    assert new_source.token_position <= target_node.token_position, f"{new_source.token_position} <= {target_node.token_position}"
+                    weight = float(new_contribution.contribution)
                     # if isinstance(new_source, IntermediateNode):
                     #     weight *= new_source.activation
                     edge = Edge(
@@ -647,18 +653,17 @@ class AttributionGraph:
                     new_sources.append(
                         QueueElement(
                             source=new_source,
-                            weight=abs(new_contribution.contribution),
+                            weight=abs(new_contribution.contribution) * influence,
                             parent=target_elem,
                         )
                     )
 
-            self.queue.add_many(new_sources, self.config.top_k_edges)
-
+        self.queue.add_many(new_sources, self.config.top_k_edges)
         return len(self.queue) > 0 or target_elem is None
 
     def flow(self, num_iterations: Optional[int] = None):
         if num_iterations is None:
-            num_iterations = self.config.flow_steps
+            num_iterations = self.config.flow_steps // self.config.batch_size
         for i in (bar := trange(num_iterations, desc="Flowing contributions")):
             with measure_time(
                 f"Iteration {i}",
@@ -676,6 +681,7 @@ class QueueElement:
     source: Node
     weight: float
     parent: Optional["QueueElement"] = None
+    added_weight: float = 0
 
     def __hash__(self):
         return hash((self.source.id, self.weight, hash(self.parent)))
@@ -694,7 +700,7 @@ class QueueElement:
         key = self.contribution  # ** (1 / len(self.sequence))
         if isinstance(self.source, IntermediateNode):
             key *= abs(self.source.activation)
-        return -abs(key)
+        return -abs(key) - abs(self.added_weight)
 
     def __lt__(self, other):
         return self.key < other.key
@@ -730,12 +736,22 @@ class NodeQueue:
             return self.pop()
         return self.unvisited.pop(highest)
 
+    def pop_n(self, n: int):
+        all_layers = set(x.source.layer_index for x in self.unvisited.values())
+        random_layer = random.choice(list(all_layers))
+        # random_layer = max(list(all_layers))
+        unvisited = {x: y for x, y in self.unvisited.items() if y.source.layer_index == random_layer and x not in self.visited}
+        if len(unvisited) < n:
+            unvisited = unvisited
+        else:
+            unvisited = random.sample(list(unvisited), n)
+        return [self.unvisited.pop(x) for x in unvisited]
+
     def add(self, node: QueueElement):
         if node.source.id in self.visited:
             return
         if node.source.id in self.unvisited:
-            if node.key < self.unvisited[node.source.id].key:
-                self.unvisited[node.source.id] = node
+            self.unvisited[node.source.id].added_weight += node.key
         else:
             self.unvisited[node.source.id] = node
 

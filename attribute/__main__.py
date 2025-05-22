@@ -17,6 +17,7 @@ async def main(
     name = "test-1-ts",
     scan = "default",
     remove_prefix = 0,
+    **kwargs,
 ):
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -24,13 +25,14 @@ async def main(
     config = AttributionConfig(
         name=name,
         scan=scan,
+        **kwargs
     )
     model = TranscodedModel(
         model_name=model_name,
         transcoder_path=transcoder_path,
         device="cuda",
     )
-    transcoded_outputs = model(prompt)
+    transcoded_outputs = model([prompt] * config.batch_size)
 
     if remove_prefix > 0:
         transcoded_outputs.input_ids = transcoded_outputs.input_ids[:, remove_prefix:]

@@ -13,7 +13,7 @@ def measure_time(name: str, disabled: bool = False):
     end_time = time.time()
     elapsed_time = end_time - start_time
     if not disabled:
-        logger.debug(f"{name}: {elapsed_time:.4f} seconds")
+        logger.info(f"{name}: {elapsed_time:.4f} seconds")
 
 
 infcache = lru_cache(maxsize=None)
