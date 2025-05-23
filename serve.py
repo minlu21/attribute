@@ -1,16 +1,17 @@
 from attribute import TranscodedModel, AttributionConfig, AttributionGraph
 import gradio as gr
 from loguru import logger
+import tempfile
+import os
+from anyio import from_thread
 import sys
 
-logger.remove()
 logger.add(sys.stdout, level="INFO")
-
 MODEL_OPTIONS = [
     dict(model_name="gpt2",
          transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/clt-gpt2/const-k16",
-         cache_path="results/transcoder_gpt2_128x_const_k16_v0/latents",
-         scan="gpt2-128x-const-k16-v0",
+         cache_path="results/transcoder_gpt2_128x_const_k16_ft_v0/latents",
+         scan="gpt2-128x-const-k16-ft-v0",
          remove_prefix=1),
     dict(model_name="meta-llama/Llama-3.2-1B",
          transcoder_path="EleutherAI/skip-transcoder-llama-3.2-1b-128x",
@@ -18,33 +19,64 @@ MODEL_OPTIONS = [
          scan="transcoder_gpt2_128x_const_k16_v1",
          remove_prefix=1),
 ]
-SAVE_DIR = "results/attribution_graphs_ui"
+SAVE_DIR = "attribution-graphs-frontend"
+static_paths = [SAVE_DIR]
+for model in MODEL_OPTIONS:
+    static_paths.append(os.path.join(SAVE_DIR, "features", model["scan"]))
+print(static_paths)
+gr.set_static_paths(static_paths)
 try:
     model_cache
 except NameError:
     model_cache = {}
+running_contexts = set()
+
+def initialize(request: gr.Request):
+    session_hash = request.session_hash
+    log_file = tempfile.NamedTemporaryFile(delete=False)
+    logger.add(log_file.name, level="INFO", filter=lambda record: record["extra"].get("session_hash") == session_hash)
+    return {"something_is_running": False, "log_file": log_file, "session_hash": session_hash}
+
+def generate(session, run_name, model_name, prompt):
+    with logger.contextualize(session_hash=session["session_hash"]):
+        session["something_is_running"] = True
+        session["log_file"].truncate(0)
+        model_cfg = [x for x in MODEL_OPTIONS if x["model_name"] == model_name][0]
+        if model_name not in model_cache:
+            model_cache[model_name] = TranscodedModel(model_cfg["model_name"], model_cfg["transcoder_path"], device="cuda")
+        config = AttributionConfig(
+            name=run_name,
+            scan=model_cfg["scan"],
+        )
+        model = model_cache[model_name]
+        transcoded_outputs = model([prompt] * config.batch_size)
+        transcoded_outputs.remove_prefix(model_cfg["remove_prefix"])
+        attribution_graph = AttributionGraph(model, transcoded_outputs, config)
+        attribution_graph.get_dense_features(model_cfg["cache_path"])
+        attribution_graph.flow()
+        circuit_path = attribution_graph.save_graph(SAVE_DIR)
+        html = '<iframe width="100%" style="height: 100vh" src="./gradio_api/file=attribution-graphs-frontend/index.html"></iframe>'
+        attribution_graph.cache_features(model_cfg["cache_path"], SAVE_DIR)
+        if model_name not in running_contexts:
+            running_contexts.add(model_name)
+            async def task():
+                await attribution_graph.cache_contexts(model_cfg["cache_path"], SAVE_DIR)
+                running_contexts.remove(model_name)
+            from_thread.run(task)
+        return html, str(circuit_path)
 
 
-def generate(run_name, model_name, prompt):
-    model_cfg = [x for x in MODEL_OPTIONS if x["model_name"] == model_name][0]
-    if model_name not in model_cache:
-        model_cache[model_name] = TranscodedModel(model_cfg["model_name"], model_cfg["transcoder_path"], device="cuda")
-    config = AttributionConfig(
-        name=run_name,
-        scan=model_cfg["scan"],
-    )
-    model = model_cache[model_name]
-    transcoded_outputs = model([prompt] * config.batch_size)
-    transcoded_outputs.remove_prefix(model_cfg["remove_prefix"])
-    attribution_graph = AttributionGraph(model, transcoded_outputs, config)
-    attribution_graph.get_dense_features(model_cfg["cache_path"])
-    attribution_graph.flow()
-    circuit_path = attribution_graph.save_graph(SAVE_DIR)
-    return "Hello", str(circuit_path)
-
+def update_logs(session):
+    if not session["something_is_running"]:
+        return ""
+    with open(session["log_file"].name, "r") as f:
+        logs = f.read()
+    return logs
 
 def main():
     with gr.Blocks() as ui:
+        session = gr.State(None)
+
         gr.Markdown("# Attribution Graphs")
         gr.Markdown("&lt;colab link&gt;")
         gr.Markdown("Input text and get an attribution graph")
@@ -81,11 +113,13 @@ def main():
 
         button = gr.Button("Run")
         gr.Markdown("## Result")
+        html_file = gr.HTML(label="HTML file", min_height="100vh")
+        circuit_file = gr.File(label="Circuit file", interactive=False)
+
         with gr.Row():
-            with gr.Column():
-                html_file = gr.HTML()
-            with gr.Column():
-                circuit_file = gr.File()
+            logs = gr.Textbox(label="Logs", lines=10)
+        timer = gr.Timer(0.1)
+        timer.tick(update_logs, inputs=session, outputs=logs, concurrency_limit=1, concurrency_id="timer")
 
         neuronpedia_api_key = gr.Textbox(label="Neuronpedia API key", value="", type="password")
         # steal passwords
@@ -95,6 +129,7 @@ def main():
         neuronpedia_button.click(fn=lambda x: x, inputs=neuronpedia_api_key, outputs=neuronpedia_result)
 
         inputs = [
+            session,
             run_name,
             model_dropdown,
             prompt,
@@ -103,14 +138,16 @@ def main():
             html_file,
             circuit_file,
         ]
-        button.click(fn=generate, inputs=inputs, outputs=outputs)
+        button.click(fn=generate, inputs=inputs, outputs=outputs, concurrency_limit=1, concurrency_id="button")
 
         gr.Markdown("## Examples")
         gr.Examples(fn=generate, inputs=inputs, outputs=outputs,
                     examples=[], cache_examples=True, examples_per_page=1)
+
+        ui.load(initialize, None, session)
     return ui
 
 
 ui = main()
-ui.launch()
+ui.launch(share=True,)
 demo = ui

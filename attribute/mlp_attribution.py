@@ -300,8 +300,8 @@ class AttributionGraph:
     def get_dense_features(self, cache_path: os.PathLike):
         cache_path = Path(cache_path)
         dense_features = set()
-        if not cache_path.exists() or not (cache_path / "cfg.json").exists() or not self.config.filter_high_freq_early:
-            logger.warning("Skipping dead feature detection because cache does not exist or filter_high_freq_early is 0")
+        if not cache_path.exists() or not cache_path.exists() or not self.config.filter_high_freq_early:
+            logger.warning("Skipping dense feature detection because cache does not exist or filter_high_freq_early is 0")
             self.dense_features = dense_features
             return
         dense_cache_path = cache_path.parent / "dense_features.json"
@@ -332,36 +332,81 @@ class AttributionGraph:
 
         self.dense_features = set((pos, *feature) for pos in range(self.seq_len) for feature in dense)
 
-    async def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
+    def cache_features(self, cache_path: os.PathLike, save_dir: os.PathLike):
+        cache_path = Path(cache_path)
+        save_dir = Path(save_dir)
+        logit_weight = self.model.logit_weight
+        logit_bias = self.model.logit_bias
+        for node in tqdm(self.exported_nodes, desc="Caching features"):
+            if node.node_type == "IntermediateNode":
+                feature_dir = save_dir / "features" / self.config.scan
+
+                layer, feature = int(node.layer_index), int(node.feature_index)
+
+                with torch.no_grad(), torch.autocast("cuda"):
+                    try:
+                        logger.disable("attribute.caching")
+                        dec_weight = self.model.w_dec(layer)[feature]
+                    finally:
+                        logger.enable("attribute.caching")
+                    logits = logit_weight @ dec_weight
+                    del dec_weight
+                    if self.config.use_logit_bias:
+                        logits += logit_bias
+                    top_logits = logits.topk(10).indices.tolist()
+                    bottom_logits = logits.topk(10, largest=False).indices.tolist()
+                top_logits = [self.model.decode_token(i) for i in top_logits]
+                bottom_logits = [self.model.decode_token(i) for i in bottom_logits]
+
+                feature_vis = dict(
+                    index=cantor(layer, feature),
+                    bottom_logits=bottom_logits,
+                    top_logits=top_logits,
+                )
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                feature_path = feature_dir / f"{cantor(layer, feature)}.json"
+                if feature_path.exists():
+                    feature_vis = json.loads(feature_path.read_text()) | feature_vis
+                feature_path.write_text(json.dumps(feature_vis))
+
+
+    async def cache_contexts(self, cache_path: os.PathLike, save_dir: os.PathLike):
+        cache_path = Path(cache_path)
+        save_dir = Path(save_dir)
+        feature_paths = {}
         module_latents = defaultdict(list)
         dead_features = set()
         for node in self.exported_nodes:
             if node.node_type == "IntermediateNode":
-                layer, feature = int(node.layer_index), int(node.feature_index)
-                dead_features.add((layer, feature))
-                module_latents[self.model.temp_hookpoints_mlp[layer]].append(feature)
+                layer_idx = node.layer_index
+                feature_idx = node.feature_index
+                feature_dir = save_dir / "features" / self.config.scan
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                feature_path = feature_dir / f"{cantor(layer_idx, feature_idx)}.json"
+                if feature_path.exists():
+                    if "examples_quantiles" in json.loads(feature_path.read_text()):
+                        continue
+                feature_paths[(layer_idx, feature_idx)] = feature_path
+                module_latents[self.model.temp_hookpoints_mlp[layer_idx]].append(feature_idx)
+                dead_features.add((layer_idx, feature_idx))
+
         module_latents = {k: torch.tensor(v) for k, v in module_latents.items()}
         module_latents = {k: v[torch.argsort(v)] for k, v in module_latents.items()}
 
         ds = self.make_latent_dataset(cache_path, module_latents)
-
-        logit_weight = self.model.logit_weight
-        logit_bias = self.model.logit_bias
 
         bar = tqdm(total=sum(map(len, module_latents.values())))
         def process_feature(feature):
             layer_idx = int(feature.latent.module_name.split(".")[-2])
             feature_idx = feature.latent.latent_index
             dead_features.discard((layer_idx, feature_idx))
-            index = cantor(layer_idx, feature_idx)
 
-            feature_dir = save_dir / "features" / self.config.scan
-            feature_dir.mkdir(parents=True, exist_ok=True)
-            feature_path = feature_dir / f"{index}.json"
+            feature_path = feature_paths[(layer_idx, feature_idx)]
 
-            if feature_path.exists():
-                examples_quantiles = json.loads(feature_path.read_text())["examples_quantiles"]
-            else:
+            feature_vis = json.loads(feature_path.read_text())
+            examples_quantiles = feature_vis.get("examples_quantiles", None)
+
+            if examples_quantiles is None:
                 examples_quantiles = defaultdict(list)
                 for example in feature.train:
                     examples_quantiles[example.quantile].append(dict(
@@ -376,27 +421,8 @@ class AttributionGraph:
                         examples=examples_quantiles[i],
                     ) for i in sorted(examples_quantiles.keys())
                 ]
-            with torch.no_grad(), torch.autocast("cuda"):
-                try:
-                    logger.disable("attribute.caching")
-                    dec_weight = self.model.w_dec(layer_idx)[feature_idx]
-                finally:
-                    logger.enable("attribute.caching")
-                logits = logit_weight @ dec_weight
-                del dec_weight
-                if self.config.use_logit_bias:
-                    logits += logit_bias
-                top_logits = logits.topk(10).indices.tolist()
-                bottom_logits = logits.topk(10, largest=False).indices.tolist()
-            top_logits = [self.model.decode_token(i) for i in top_logits]
-            bottom_logits = [self.model.decode_token(i) for i in bottom_logits]
+            feature_vis["examples_quantiles"] = examples_quantiles
 
-            feature_vis = dict(
-                index=index,
-                examples_quantiles=examples_quantiles,
-                bottom_logits=bottom_logits,
-                top_logits=top_logits,
-            )
             feature_path.write_text(json.dumps(feature_vis))
             bar.update(1)
             bar.refresh()
