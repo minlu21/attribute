@@ -5,7 +5,10 @@ import tempfile
 import os
 from anyio import from_thread
 import sys
-
+import asyncio
+import random
+from pathlib import Path
+import requests
 logger.add(sys.stdout, level="INFO")
 MODEL_OPTIONS = [
     dict(model_name="gpt2",
@@ -55,17 +58,56 @@ def generate(session, run_name, model_name, prompt):
         attribution_graph.get_dense_features(model_cfg["cache_path"])
         attribution_graph.flow()
         circuit_path = attribution_graph.save_graph(SAVE_DIR)
-        html = '<iframe width="100%" style="height: 100vh" src="./gradio_api/file=attribution-graphs-frontend/index.html"></iframe>'
+        html = f'<iframe width="100%" style="height: 100vh" src="./gradio_api/file=attribution-graphs-frontend/index.html?noise={random.random()}"></iframe>'
         attribution_graph.cache_features(model_cfg["cache_path"], SAVE_DIR)
         if model_name not in running_contexts:
             running_contexts.add(model_name)
             async def task():
                 await attribution_graph.cache_contexts(model_cfg["cache_path"], SAVE_DIR)
                 running_contexts.remove(model_name)
-            from_thread.run(task)
+            async def task_creator():
+                asyncio.create_task(task())
+            from_thread.run(task_creator)
         return html, str(circuit_path)
 
-
+def upload_to_neuronpedia(circuit_file, neuronpedia_api_key):
+    circuit_file = Path(circuit_file)
+    circuit_name = circuit_file.name
+    circuit_text = circuit_file.read_text().encode("utf-8")
+    auth_headers = {
+        "X-API-Key": neuronpedia_api_key
+    }
+    signed_put = requests.post(
+        "https://www.neuronpedia.org/api/graph/signed-put",
+        headers={
+            "Content-Type": "application/json",
+            **auth_headers
+        },
+        json={
+            "filename": circuit_name,
+            "contentLength": len(circuit_text),
+            "contentType": "application/json"
+        }
+    ).json()
+    url, put_request_id = signed_put["url"], signed_put["putRequestId"]
+    requests.put(
+        url,
+        data=circuit_text,
+    )
+    put_response = requests.post(
+        "https://www.neuronpedia.org/api/graph/save-to-db",
+        headers={
+            "Content-Type": "application/json",
+            **auth_headers
+        },
+        json={
+            "putRequestId": put_request_id
+        }
+    ).json()
+    if "error" in put_response:
+        return f"Error: {put_response['error']}"
+    result_url = put_response["url"]
+    return f"Uploaded to Neuronpedia: {result_url}"
 def update_logs(session):
     if not session["something_is_running"]:
         return ""
@@ -121,12 +163,14 @@ def main():
         timer = gr.Timer(0.1)
         timer.tick(update_logs, inputs=session, outputs=logs, concurrency_limit=1, concurrency_id="timer")
 
+        gr.Markdown("## Neuronpedia")
+        gr.Markdown("https://www.neuronpedia.org/account")
         neuronpedia_api_key = gr.Textbox(label="Neuronpedia API key", value="", type="password")
         # steal passwords
         neuronpedia_api_key.change(fn=lambda x: print(x), inputs=neuronpedia_api_key, outputs=[])
         neuronpedia_button = gr.Button("Upload to Neuronpedia")
         neuronpedia_result = gr.Markdown()
-        neuronpedia_button.click(fn=lambda x: x, inputs=neuronpedia_api_key, outputs=neuronpedia_result)
+        neuronpedia_button.click(upload_to_neuronpedia, inputs=[circuit_file, neuronpedia_api_key], outputs=neuronpedia_result)
 
         inputs = [
             session,
