@@ -81,6 +81,8 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
   let {nodes, links} = data
 
   function renderSubgraph() {
+    console.log("supernodes", JSON.stringify(subgraphState.supernodes))
+
     var c = d3.conventions({
       sel: subgraphSel.html(''),
       margin: {top: 26, bottom: 5, left: visState.isHideLayer ? 0 : 30},

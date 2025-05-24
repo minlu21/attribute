@@ -39,7 +39,8 @@ async def main(
     attribution_graph.get_dense_features(cache_path)
     attribution_graph.flow()
     attribution_graph.save_graph(save_dir)
-    await attribution_graph.cache_features(cache_path, save_dir)
+    attribution_graph.cache_features(cache_path, save_dir)
+    await attribution_graph.cache_contexts(cache_path, save_dir)
 
 
 if __name__ == "__main__":

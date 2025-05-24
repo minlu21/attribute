@@ -108,6 +108,7 @@ def upload_to_neuronpedia(circuit_file, neuronpedia_api_key):
         return f"Error: {put_response['error']}"
     result_url = put_response["url"]
     return f"Uploaded to Neuronpedia: {result_url}"
+
 def update_logs(session):
     if not session["something_is_running"]:
         return ""

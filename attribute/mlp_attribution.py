@@ -1,13 +1,13 @@
 import json
 import os
 import random
+import numpy as np
+import torch
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Literal
 
-import numpy as np
-import torch
 from delphi.config import ConstructorConfig, SamplerConfig
 from delphi.latents import LatentDataset
 from loguru import logger
@@ -25,6 +25,8 @@ class AttributionConfig:
     name: str
     # ID for the model the features are from
     scan: str
+    # seed for random number generator
+    seed: int = 42
 
     # how many target nodes to compute contributions for
     flow_steps: int = 5000
@@ -56,6 +58,12 @@ class AttributionConfig:
     # correct for bias when saving top output logits
     use_logit_bias: bool = False
 
+    use_self_explanation: bool = False
+    selfe_min_strength: float = 2.0
+    selfe_max_strength: float = 8.0
+    selfe_n: int = 16
+    selfe_n_tokens: int = 8
+
 
 class AttributionGraph:
     def __init__(
@@ -71,6 +79,9 @@ class AttributionGraph:
         self.edges: dict[str, Edge] = {}
         self.nodes_by_layer_and_token: dict[int, dict[int, list[Node]]] = {}
         self.initialize_graph()
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        torch.manual_seed(self.config.seed)
 
     @property
     def tokenizer(self):
@@ -161,16 +172,18 @@ class AttributionGraph:
         else:
             influence = self.influence
 
+        original_adj_matrix = adj_matrix
+
         influence = np.abs(influence) * activation_sources
         influence = influence / np.maximum(1e-2, influence.sum(axis=1, keepdims=True))
         adj_matrix = np.abs(adj_matrix) * activation_sources
         adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
 
         total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
-        logger.info(f"Completeness score: {total_error_influence:.3f}")
+        logger.info(f"Completeness score (unpruned): {total_error_influence:.3f}")
 
         total_error_influence = 1 - (influence_sources @ influence) @ error_mask
-        logger.info(f"Replacement score: {total_error_influence:.3f}")
+        logger.info(f"Replacement score (unpruned): {total_error_influence:.3f}")
 
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
@@ -199,7 +212,28 @@ class AttributionGraph:
                     if usage[dedup_node_indices[node]] > self.config.secondary_threshold
                 ]
                 selected_nodes.extend(matching_nodes)
+
         logger.info(f"Selected {len(selected_nodes)} nodes")
+
+        filtered_mask = np.zeros((len(dedup_node_names),), dtype=bool)
+        for node in selected_nodes:
+            filtered_mask[dedup_node_indices[node]] = 1
+        for node in dedup_node_names:
+            if node.startswith("error"):
+                filtered_mask[dedup_node_indices[node]] = 1
+
+        filtered_adj_matrix = original_adj_matrix[filtered_mask][:, filtered_mask]
+        filtered_influence = np.linalg.inv(np.eye(len(filtered_adj_matrix)) - filtered_adj_matrix) - np.eye(len(filtered_adj_matrix))
+
+        filtered_influence = np.abs(filtered_influence) * activation_sources[filtered_mask]
+        filtered_influence = filtered_influence / np.maximum(1e-2, filtered_influence.sum(axis=1, keepdims=True))
+        filtered_adj_matrix = np.abs(filtered_adj_matrix) * activation_sources[filtered_mask]
+        filtered_adj_matrix = filtered_adj_matrix / np.maximum(1e-2, filtered_adj_matrix.sum(axis=1, keepdims=True))
+
+        total_pruned_influence = float(1 - (influence_sources[filtered_mask] @ filtered_adj_matrix) @ error_mask[filtered_mask])
+        logger.info(f"Completeness score: {total_pruned_influence:.3f}")
+        total_pruned_influence = float(1 - (influence_sources[filtered_mask] @ filtered_influence) @ error_mask[filtered_mask])
+        logger.info(f"Replacement score: {total_pruned_influence:.3f}")
 
         export_nodes = []
         for n in selected_nodes:
@@ -300,7 +334,8 @@ class AttributionGraph:
     def get_dense_features(self, cache_path: os.PathLike):
         cache_path = Path(cache_path)
         dense_features = set()
-        if not cache_path.exists() or not cache_path.exists() or not self.config.filter_high_freq_early:
+        print(cache_path, list(cache_path.glob("*")))
+        if not cache_path.exists() or not len(list(cache_path.glob("*"))) or not self.config.filter_high_freq_early:
             logger.warning("Skipping dense feature detection because cache does not exist or filter_high_freq_early is 0")
             self.dense_features = dense_features
             return
