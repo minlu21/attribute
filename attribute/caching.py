@@ -70,6 +70,7 @@ class TranscodedModel(object):
         transcoder_path: os.PathLike,
         hookpoint_fn=None,
         device="cuda",
+        pre_ln_hook: bool = False,
     ):
         logger.info(f"Loading model {model_name} on device {device}")
         self.device = device
@@ -127,6 +128,7 @@ class TranscodedModel(object):
             for i, k in enumerate(arr)
         }
         self.module_to_name = {v: k for k, v in self.name_to_module.items()}
+        self.pre_ln_hook = pre_ln_hook
 
     def clear_hooks(self):
         for mod in self.model.modules():
@@ -177,6 +179,15 @@ class TranscodedModel(object):
         for hookpoint in self.hookpoints_ln:
             self.name_to_module[hookpoint].register_forward_hook(partial(ln_record_hook, save_dict=second_ln))
 
+        if self.pre_ln_hook:
+            resid_mid = {}
+            def record_resid_mid(module, input, output):
+                if isinstance(input, tuple):
+                    input = input[0]
+                resid_mid[self.name_to_index[self.module_to_name[module]]] = input
+            for hookpoint in self.hookpoints_ln:
+                self.name_to_module[hookpoint].register_forward_hook(record_resid_mid)
+
         runner = CrossLayerRunner()
         target_transcoder_activations = {}
         source_transcoder_activations = {}
@@ -189,6 +200,10 @@ class TranscodedModel(object):
                 input = input[0]
 
             module_name = self.module_to_name[module]
+            layer_idx = self.name_to_index[module_name]
+            if self.pre_ln_hook:
+                input = resid_mid[layer_idx]
+
             transcoder = self.transcoders[module_name]
             # have to reshape input to lose the batch dimension
             batch_dims = input.shape[:-1]
@@ -196,7 +211,6 @@ class TranscodedModel(object):
             # have to normalize input
             transcoder_acts = runner.encode(input, transcoder)
 
-            layer_idx = self.name_to_index[module_name]
             masked_features = mask_features.get(layer_idx, [])
             steered_features = steer_features.get(layer_idx, [])
             if latents_from_errors:
@@ -256,7 +270,8 @@ class TranscodedModel(object):
             error = error.clone()
             error.detach_()
             error.requires_grad_(True)
-            logger.info(f"Layer {module_name} error: {diff.norm() / output.norm()}")
+            fvu_approx = diff[:, 1:].pow(2).sum() / output[:, 1:].pow(2).sum()
+            logger.info(f"Layer {module_name} error: {fvu_approx.item()}")
 
             latent_indices = transcoder_acts.latent_indices.unflatten(0, batch_dims)
             target_transcoder_activations[module_name] = target_latent_acts
@@ -471,8 +486,11 @@ class TranscodedModel(object):
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
         return self.transcoders[self.hookpoints_mlp[layer_idx]].encoder.weight
 
+    def get_layer(self, layer_idx: int) -> torch.nn.Module:
+        return self.model.get_submodule(self.layer_prefix)[layer_idx]
+
     def attn(self, layer_idx: int) -> torch.nn.Module:
-        layer = self.model.get_submodule(self.layer_prefix)[layer_idx]
+        layer = self.get_layer(layer_idx)
         if isinstance(self.model, LlamaLike):
             return layer.self_attn
         elif isinstance(self.model, GPTNeoPreTrainedModel):

@@ -61,7 +61,9 @@ class AttributionConfig:
     use_self_explanation: bool = True
     selfe_min_strength: float = 2.0
     selfe_max_strength: float = 8.0
-    selfe_n: int = 16
+    self_sim_layer: int = 15
+    selfe_n: int = 64
+    selfe_pick: int = 5
     selfe_n_tokens: int = 8
 
 
@@ -409,7 +411,7 @@ class AttributionGraph:
             return
         cache_path = Path(cache_path)
         save_dir = Path(save_dir)
-        for node in tqdm(self.exported_nodes, desc="Caching self explanations"):
+        for node in tqdm(self.exported_nodes, desc="Caching self-explanations"):
             if node.node_type == "IntermediateNode":
                 explanation = self.self_explain_feature(node)
                 feature_dir = save_dir / "features" / self.config.scan
@@ -447,9 +449,9 @@ class AttributionGraph:
         strengths = torch.linspace(min_strength, max_strength, batch_size, device=self.model.device)
         emb_vec = emb_vec[None, :] * strengths[:, None]
         tokens = self.model.tokenizer([prompt] * batch_size, return_tensors="pt").to(self.model.device).input_ids
-        state = (tokens, tokens, None)
+        state = (tokens, tokens, None, None, None)
         def step(state):
-            all_tokens, tokens, cache = state
+            all_tokens, tokens, cache, entropy, self_similarity = state
             for m in self.model.model.modules():
                 m._forward_hooks = OrderedDict()
 
@@ -460,12 +462,30 @@ class AttributionGraph:
 
                 self.model.embedding_module.register_forward_hook(patch)
 
+                def collect_self_similarity(module, input, output):
+                    nonlocal self_similarity
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    self_similarity = torch.nn.functional.cosine_similarity(
+                        output[:, -1],
+                        emb_vec,
+                        dim=-1
+                    )[0]
+
+                self.model.get_layer(self.config.self_sim_layer).register_forward_hook(collect_self_similarity)
+
             output = self.model.model(tokens, past_key_values=cache)
             logits = output.logits
+
+            if entropy is None:
+                probs = torch.nn.functional.softmax(logits[:, -1], dim=-1)
+                logprobs = torch.nn.functional.log_softmax(logits[:, -1], dim=-1)
+                entropy = -torch.sum(probs * logprobs, dim=-1)
+
             probs = torch.nn.functional.softmax(logits[:, -1], dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1)
             all_tokens = torch.cat([all_tokens, next_tokens], dim=1)
-            return (all_tokens, next_tokens, output.past_key_values)
+            return (all_tokens, next_tokens, output.past_key_values, entropy, self_similarity)
 
         try:
             for _ in range(seq_len):
@@ -475,6 +495,14 @@ class AttributionGraph:
         finally:
             logger.enable("attribute")
         decoded = [self.model.tokenizer.decode(seq[len(tokenized_prompt):]) for seq in tokens.tolist()]
+        entropy, self_similarity = state[3:5]
+        entropy = entropy - entropy.min()
+        entropy = entropy / entropy.max()
+        self_similarity = self_similarity - self_similarity.min()
+        self_similarity = self_similarity / self_similarity.max()
+        top_self_sims = torch.topk(self_similarity, k=self.config.selfe_pick).indices.tolist()
+        decoded = [decoded[i] for i in top_self_sims]
+        # decoded = [str((float(entropy), float(self_sim))) + decoded for entropy, self_sim, decoded in zip(entropy, self_similarity, decoded)]
         decoded = [decoded.partition('"')[0].partition("\n")[0] for decoded in decoded]
         return decoded
 
