@@ -80,9 +80,10 @@ for supernode, node_list in supernodes.items():
     )
     steered_supernode_activations = get_supernode_activations(steered_activations)
     i = list(supernodes.keys()).index(supernode)
-    j = list(supernodes.keys()).index(supernode)
-    steered_matrix[i, j] = steered_supernode_activations[supernode]
-# %%
+    for supernode_target in steered_supernode_activations:
+        j = list(supernodes.keys()).index(supernode_target)
+        steered_matrix[i, j] = steered_supernode_activations[supernode_target]
+steered_matrix /= (steered_matrix * np.eye(len(supernodes)) + 1e-6).sum(axis=1, keepdims=True)
 
 x_ticks = list(supernodes.keys())
 plt.imshow(steered_matrix)
