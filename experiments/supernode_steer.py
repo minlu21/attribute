@@ -94,13 +94,14 @@ for edge in superedges:
     source_idx = list(supernodes.keys()).index(edge['source'])
     target_idx = list(supernodes.keys()).index(edge['target'])
     # Draw rectangle around the cell
+    base_color = "FFA500" if edge['weight'] > 0 else "0000FF"
     opacity = abs(edge['weight']) ** 0.5
     op_hex = int(opacity * 255)
     op_hex = str(hex(op_hex))[2:].zfill(2)
     rect = plt.Rectangle((target_idx-0.5+0.04, source_idx-0.5+0.04),
                          0.93, 0.93,
                         fill=False,
-                        edgecolor=f"#FFA500{op_hex}",
+                        edgecolor=f"#{base_color}{op_hex}",
                         linewidth=10)
     plt.gca().add_patch(rect)
 

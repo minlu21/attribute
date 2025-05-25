@@ -17,6 +17,8 @@ old_embedding_weight = model.embedding_weight.clone()
 old_logit_weight = model.logit_weight.clone()
 #%%
 from collections import OrderedDict
+from loguru import logger
+from tqdm import tqdm
 # layer, feature = 10, 20286
 # layer, feature = 12, 57243
 layer, feature = 12, 86448
@@ -26,8 +28,6 @@ START_SPECIAL = 128011
 # token_index = 6
 prompt = "ONLINE DICTIONARY\nThe meaning of the word ? is \""
 tokenized_prompt = model.tokenizer.encode(prompt)
-from loguru import logger
-from tqdm import tqdm
 token_index = tokenized_prompt.index(949)
 tokenized_prompt[token_index] = START_SPECIAL
 token_id = tokenized_prompt[token_index]
@@ -86,4 +86,7 @@ finally:
     logger.enable("attribute")
 [model.tokenizer.decode(seq[len(tokenized_prompt):]) for seq in tokens.tolist()]
 # %%
+# %%
+
+model.tokenizer.encode("a ?")
 # %%

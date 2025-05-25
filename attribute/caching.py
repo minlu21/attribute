@@ -346,15 +346,18 @@ class TranscodedModel(object):
             return "c_proj"
         else:
             raise ValueError(f"Unsupported model type: {type(self.model)}")
+    @property
+    def embedding_module(self):
+        if isinstance(self.model, LlamaLike):
+            return self.model.model.embed_tokens
+        elif isinstance(self.model, GPT2Like):
+            return self.model.transformer.wte
+        else:
+            raise ValueError(f"Unsupported model type: {type(self.model)}")
 
     @property
     def embedding_weight(self):
-        if isinstance(self.model, LlamaLike):
-            return self.model.model.embed_tokens.weight
-        elif isinstance(self.model, GPT2Like):
-            return self.model.transformer.wte.weight
-        else:
-            raise ValueError(f"Unsupported model type: {type(self.model)}")
+        return self.embedding_module.weight
 
     @property
     def parallel_attn(self):

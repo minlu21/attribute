@@ -3,7 +3,7 @@ import os
 import random
 import numpy as np
 import torch
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Literal
@@ -58,7 +58,7 @@ class AttributionConfig:
     # correct for bias when saving top output logits
     use_logit_bias: bool = False
 
-    use_self_explanation: bool = False
+    use_self_explanation: bool = True
     selfe_min_strength: float = 2.0
     selfe_max_strength: float = 8.0
     selfe_n: int = 16
@@ -404,6 +404,79 @@ class AttributionGraph:
                     feature_vis = json.loads(feature_path.read_text()) | feature_vis
                 feature_path.write_text(json.dumps(feature_vis))
 
+    def cache_self_explanations(self, cache_path: os.PathLike, save_dir: os.PathLike):
+        if not self.config.use_self_explanation:
+            return
+        cache_path = Path(cache_path)
+        save_dir = Path(save_dir)
+        for node in tqdm(self.exported_nodes, desc="Caching self explanations"):
+            if node.node_type == "IntermediateNode":
+                explanation = self.self_explain_feature(node)
+                feature_dir = save_dir / "features" / self.config.scan
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                feature_path = feature_dir / f"{cantor(node.layer_index, node.feature_index)}.json"
+                if feature_path.exists():
+                    explanation = json.loads(feature_path.read_text()) | explanation
+                feature_path.write_text(json.dumps(explanation))
+
+    @torch.inference_mode()
+    def self_explain_feature(self, node: IntermediateNode):
+        layer, feature = node.layer_index, node.feature_index
+        w_dec = self.model.w_dec(layer, use_skip=True)[feature]
+        w_enc = self.model.w_enc(layer)[feature]
+        strengths = torch.linspace(self.config.selfe_min_strength, self.config.selfe_max_strength, self.config.selfe_n, device=self.model.device)
+        w_dec = w_dec[None, :] * strengths[:, None]
+        w_enc = w_enc[None, :] * strengths[:, None]
+        dec_explanations = self.self_explain_generate(w_dec, min_strength=self.config.selfe_min_strength, max_strength=self.config.selfe_max_strength, seq_len=self.config.selfe_n_tokens)
+        enc_explanations = self.self_explain_generate(w_enc, min_strength=self.config.selfe_min_strength, max_strength=self.config.selfe_max_strength, seq_len=self.config.selfe_n_tokens)
+        return dict(
+            self_explanation_enc=enc_explanations,
+            self_explanation_dec=dec_explanations,
+        )
+
+    def self_explain_generate(self, vectors: torch.Tensor,
+                              *, min_strength: float,
+                              max_strength: float,
+                              seq_len: int):
+        prompt = "ONLINE DICTIONARY\nThe meaning of the word ? is \""
+        tokenized_prompt = self.model.tokenizer.encode(prompt)
+        question_mark_token = self.model.tokenizer.encode("a ?")[-1]
+        token_index = tokenized_prompt.index(question_mark_token)
+        emb_vec = vectors / vectors.norm(dim=-1, keepdim=True)
+        batch_size = vectors.shape[0]
+        strengths = torch.linspace(min_strength, max_strength, batch_size, device=self.model.device)
+        emb_vec = emb_vec[None, :] * strengths[:, None]
+        tokens = self.model.tokenizer([prompt] * batch_size, return_tensors="pt").to(self.model.device).input_ids
+        state = (tokens, tokens, None)
+        def step(state):
+            all_tokens, tokens, cache = state
+            for m in self.model.model.modules():
+                m._forward_hooks = OrderedDict()
+
+            if tokens.shape[1] != 1:
+                def patch(module, input, output):
+                    output[:, token_index] = emb_vec
+                    return output
+
+                self.model.embedding_module.register_forward_hook(patch)
+
+            output = self.model.model(tokens, past_key_values=cache)
+            logits = output.logits
+            probs = torch.nn.functional.softmax(logits[:, -1], dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)
+            all_tokens = torch.cat([all_tokens, next_tokens], dim=1)
+            return (all_tokens, next_tokens, output.past_key_values)
+
+        try:
+            for _ in range(seq_len):
+                logger.disable("attribute")
+                state = step(state)
+                tokens = state[0]
+        finally:
+            logger.enable("attribute")
+        decoded = [self.model.tokenizer.decode(seq[len(tokenized_prompt):]) for seq in tokens.tolist()]
+        decoded = [decoded.partition('"')[0].partition("\n")[0] for decoded in decoded]
+        return decoded
 
     async def cache_contexts(self, cache_path: os.PathLike, save_dir: os.PathLike):
         cache_path = Path(cache_path)

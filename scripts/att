@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 
-# PROMPT_NAME="basketball-llama"
-PROMPT_NAME="basketball-llama-base"
-# --transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/llama-finetune/test-0" \
+PROMPT_NAME="basketball-llama"
+# PROMPT_NAME="basketball-llama-base"
+SCAN=transcoder_llama_131k_highbs_v0
 set -e
 PROMPT_TEXT="Michael Jordan plays the sport of"
 uv run python -m attribute --model_name="meta-llama/Llama-3.2-1B" \
---transcoder_path="EleutherAI/skip-transcoder-Llama-3.2-1B-131k" \
---cache_path=results/transcoder_llama_131k/latents \
+--cache_path=results/$SCAN/latents \
 --name $PROMPT_NAME \
---scan "transcoder_llama_131k" \
+--scan "$SCAN" \
 "$PROMPT_TEXT" \
---remove_prefix 1
+--remove_prefix 1 \
+--transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/llama/high-bs" \
+
 # --transcoder_path="EleutherAI/skip-transcoder-Llama-3.2-1B-131k" \
 exit
 
