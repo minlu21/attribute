@@ -200,8 +200,10 @@ class TranscodedModel(object):
             masked_features = mask_features.get(layer_idx, [])
             steered_features = steer_features.get(layer_idx, [])
             if latents_from_errors:
-                transcoder_acts.latent_acts = errors_from.mlp_outputs[layer_idx].latent_acts
-                transcoder_acts.latent_indices = errors_from.mlp_outputs[layer_idx].latent_indices
+                act = errors_from.mlp_outputs[layer_idx].activation
+                transcoder_acts.latent_acts = act.view(-1, act.shape[-1])
+                loc = errors_from.mlp_outputs[layer_idx].location
+                transcoder_acts.latent_indices = loc.view(-1, loc.shape[-1])
             if masked_features:
                 acts = transcoder_acts.latent_acts
                 indices = transcoder_acts.latent_indices

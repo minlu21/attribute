@@ -81,8 +81,6 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
   let {nodes, links} = data
 
   function renderSubgraph() {
-    console.log("supernodes", JSON.stringify(subgraphState.supernodes))
-
     var c = d3.conventions({
       sel: subgraphSel.html(''),
       margin: {top: 26, bottom: 5, left: visState.isHideLayer ? 0 : 30},
@@ -206,6 +204,15 @@ window.initCgSubgraph = function ({visState, renderAll, data, cgSel}) {
       })
       .filter(d => d.source !== d.target)
     sgLinks = d3.sort(sgLinks, d => Math.abs(d.weight))
+
+    console.log("supernodes",
+      JSON.stringify(subgraphState.supernodes),
+    )
+    console.log("superedges", JSON.stringify(sgLinks.map(x => ({
+      source: x.source,
+      target: x.target,
+      weight: x.weight,
+    }))))
 
     let xScale = d3.scaleLinear()
       .domain(d3.extent(sgNodes.map(d => d.ctx_idx)))
