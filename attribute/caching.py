@@ -146,6 +146,7 @@ class TranscodedModel(object):
                  mask_features: dict[int, list[int]] = {},
                  steer_features: dict[int, list[(int, int, float)]] = {},
                  errors_from: TranscodedOutputs | None = None,
+                 latents_from_errors: bool = False,
                  no_error: bool = False) -> TranscodedOutputs:
         if isinstance(prompt, str):
             tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -198,6 +199,9 @@ class TranscodedModel(object):
             layer_idx = self.name_to_index[module_name]
             masked_features = mask_features.get(layer_idx, [])
             steered_features = steer_features.get(layer_idx, [])
+            if latents_from_errors:
+                transcoder_acts.latent_acts = errors_from.mlp_outputs[layer_idx].latent_acts
+                transcoder_acts.latent_indices = errors_from.mlp_outputs[layer_idx].latent_indices
             if masked_features:
                 acts = transcoder_acts.latent_acts
                 indices = transcoder_acts.latent_indices
