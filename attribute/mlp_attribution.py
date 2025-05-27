@@ -42,7 +42,7 @@ class AttributionConfig:
     # remove MLP edges below this threshold
     pre_filter_threshold: float = 1e-3
     # keep edges above this threshold
-    edge_threshold = 1e-3
+    edge_threshold = 1e-2
     # keep top k edges for each node
     top_k_edges: int = 32
 
@@ -58,7 +58,7 @@ class AttributionConfig:
     # correct for bias when saving top output logits
     use_logit_bias: bool = False
 
-    use_self_explanation: bool = True
+    use_self_explanation: bool = False
     selfe_min_strength: float = 2.0
     selfe_max_strength: float = 8.0
     self_sim_layer: int = 15
@@ -132,6 +132,8 @@ class AttributionGraph:
         return adj_matrix, dedup_node_names
 
     def make_latent_dataset(self, cache_path: os.PathLike, module_latents: dict[str, torch.Tensor]):
+        if self.model.pre_ln_hook and module_latents:
+            module_latents = {k.replace(".mlp", f".{self.model.mlp_layernorm_name}"): v for k, v in module_latents.items()}
         return LatentDataset(
             cache_path,
             SamplerConfig(n_examples_train=10, train_type="top", n_examples_test=0),
@@ -336,7 +338,6 @@ class AttributionGraph:
     def get_dense_features(self, cache_path: os.PathLike):
         cache_path = Path(cache_path)
         dense_features = set()
-        print(cache_path, list(cache_path.glob("*")))
         if not cache_path.exists() or not len(list(cache_path.glob("*"))) or not self.config.filter_high_freq_early:
             logger.warning("Skipping dense feature detection because cache does not exist or filter_high_freq_early is 0")
             self.dense_features = dense_features
@@ -362,6 +363,8 @@ class AttributionGraph:
                 too_high = freqs > self.config.filter_high_freq_early
 
                 # dead_features[module].extend(unique[too_high].tolist())
+                if self.model.pre_ln_hook:
+                    module = module.replace(f".{self.model.mlp_layernorm_name}", ".mlp")
                 layer_idx = self.model.temp_hookpoints_mlp.index(module)
                 feature_names = [[layer_idx, feature] for feature in unique[too_high].tolist()]
                 dense.extend(feature_names)
