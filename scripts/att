@@ -7,7 +7,7 @@ PROMPT_NAME="basketball-llama"
 # SCAN=transcoder_llama_131k_mntss
 # SCAN=transcoder_llama_131k_mntss_kl
 # SCAN=transcoder_llama_131k_adam
-SCAN=transcoder_llama_131k_adam_kl
+SCAN=transcoder-llama-131k-adam-kl
 # SCAN=smollm_v0
 set -e
 PROMPT_TEXT="Michael Jordan plays the sport of"

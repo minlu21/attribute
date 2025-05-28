@@ -878,6 +878,7 @@ class AttributionLayer:
 class AttributionQueue:
     def __init__(self, cache: TranscodedOutputs, graph: AttributionGraph):
         self.graph = graph
+        self.cache = cache
         self.layers = {
             layer: AttributionLayer(
                 visited=torch.zeros(output.activation.shape[1:], device=cache.input_ids.device, dtype=torch.bool),
@@ -892,9 +893,11 @@ class AttributionQueue:
             for layer, output in cache.mlp_outputs.items()
         }
 
+    @torch.no_grad()
     def contribution_not_visited(self, layer: int):
-        return (self.layers[layer].contributions * ~self.layers[layer].visited).flatten()
+        return (self.layers[layer].contributions * ~self.layers[layer].visited * self.cache.mlp_outputs[layer].activation[0]).flatten()
 
+    @torch.no_grad()
     def pop_n(self, n: int):
         layer = random.choice(list(layer for layer in self.layers.keys() if self.contribution_not_visited(layer).sum().item() > 0))
         contribution_not_visited = self.contribution_not_visited(layer)
