@@ -42,13 +42,13 @@ class AttributionConfig:
 
     # remove MLP edges below this threshold
     pre_filter_threshold: float = 1e-3
-    # keep edges above this threshold
-    edge_threshold = 1e-2
+    # keep edges that make up this fraction of the total influence
+    edge_cum_threshold: float = 0.95
     # keep top k edges for each node
     top_k_edges: int = 32
 
-    # always keep nodes above this threshold of influence
-    node_threshold = 5e-4
+    # keep nodes that make up this fraction of the total influence
+    node_cum_threshold: float = 0.8
     # keep per_layer_position nodes above this threshold for each layer/position pair
     secondary_threshold = 1e-5
     per_layer_position = 0
@@ -198,6 +198,12 @@ class AttributionGraph:
                   if self.nodes[node].node_type in ("OutputNode",)
                   + (("InputNode",) if self.config.keep_all_input_nodes else ())
                   + (("ErrorNode",) if self.config.keep_all_error_nodes else ())]
+
+        sorted_usage = np.sort(usage)[::-1]
+        cumsum_usage = np.cumsum(sorted_usage)
+        cumsum_usage = cumsum_usage / cumsum_usage[-1]
+        node_threshold = sorted_usage[np.searchsorted(cumsum_usage, self.config.node_cum_threshold)]
+
         for seq_idx in range(self.cache.input_ids.shape[-1]):
             for layer_idx in range(self.num_layers):
                 matching_nodes = [
@@ -210,7 +216,7 @@ class AttributionGraph:
                 matching_nodes = matching_nodes[:self.config.per_layer_position] + [
                     node
                     for node in matching_nodes[self.config.per_layer_position:]
-                    if usage[dedup_node_indices[node]] > self.config.node_threshold
+                    if usage[dedup_node_indices[node]] > node_threshold
                 ]
                 matching_nodes = [
                     node for node in matching_nodes
@@ -226,6 +232,7 @@ class AttributionGraph:
         for node in dedup_node_names:
             if node.startswith("error"):
                 filtered_mask[dedup_node_indices[node]] = 1
+        filtered_index = np.cumsum(filtered_mask) - 1
 
         filtered_adj_matrix = original_adj_matrix[filtered_mask][:, filtered_mask]
         filtered_influence = np.linalg.inv(np.eye(len(filtered_adj_matrix)) - filtered_adj_matrix) - np.eye(len(filtered_adj_matrix))
@@ -245,11 +252,19 @@ class AttributionGraph:
             export_nodes.append(self.nodes[n])
         self.exported_nodes = export_nodes
 
+        selected_edge_matrix = np.sort(filtered_influence.flatten())[::-1]
+        edge_cumsum = np.cumsum(selected_edge_matrix)
+        edge_cumsum = edge_cumsum / edge_cumsum[-1]
+        edge_threshold = selected_edge_matrix[np.searchsorted(edge_cumsum, self.config.edge_cum_threshold)]
+
         export_edges = []
         for edge in self.edges.values():
             if not (edge.source.id in selected_nodes and edge.target.id in selected_nodes):
                 continue
-            if abs(influence[dedup_node_indices[edge.target.id], dedup_node_indices[edge.source.id]]) < self.config.edge_threshold:
+            if abs(
+                filtered_influence[filtered_index[dedup_node_indices[edge.target.id]],
+                                   filtered_index[dedup_node_indices[edge.source.id]]]
+                ) < edge_threshold:
                 continue
             export_edges.append(edge)
         self.exported_edges = export_edges
@@ -267,6 +282,7 @@ class AttributionGraph:
             prompt="".join(tokens),
             title_prefix="",
             n_layers=self.model.num_layers,
+            node_threshold=node_threshold,
         )
 
         nodes_json = [
