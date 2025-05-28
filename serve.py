@@ -1,26 +1,42 @@
 from attribute import TranscodedModel, AttributionConfig, AttributionGraph
+from attribute.utils import cantor_decode
 import gradio as gr
+import traceback
 from loguru import logger
+import json
 import tempfile
 import os
 from anyio import from_thread
-import sys
 import asyncio
 import random
 from pathlib import Path
 import requests
-logger.add(sys.stdout, level="INFO")
+from collections import defaultdict
+import neuronpedia
+from neuronpedia.np_graph_metadata import NPGraphMetadata
+from neuronpedia.np_model import Model as NPModel
+from neuronpedia.np_source_set import SourceSet
+from neuronpedia.np_feature import Feature
+from neuronpedia.np_activation import Activation
+import neuronpedia.requests.base_request
+
+
 MODEL_OPTIONS = [
+    dict(model_name="meta-llama/Llama-3.2-1B",
+         model_id="llama3.1-8b",
+        #  transcoder_path="EleutherAI/skip-transcoder-llama-3.2-1b-128x",
+         transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/llama-finetune/adam",
+         cache_path="results/transcoder-llama-131k-adam-kl/latents",
+         scan="transcoder-llama-131k-adam-kl",
+         remove_prefix=1,
+         num_layers=16),
     dict(model_name="gpt2",
+         model_id="gpt2",
          transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/clt-gpt2/const-k16",
          cache_path="results/transcoder_gpt2_128x_const_k16_ft_v0/latents",
          scan="gpt2-128x-const-k16-ft-v0",
-         remove_prefix=1),
-    dict(model_name="meta-llama/Llama-3.2-1B",
-         transcoder_path="EleutherAI/skip-transcoder-llama-3.2-1b-128x",
-         cache_path="results/transcoder_llama_131k/latents",
-         scan="transcoder_gpt2_128x_const_k16_v1",
-         remove_prefix=1),
+         remove_prefix=1,
+         num_layers=12),
 ]
 SAVE_DIR = "attribution-graphs-frontend"
 static_paths = [SAVE_DIR]
@@ -50,6 +66,7 @@ def generate(session, run_name, model_name, prompt):
         config = AttributionConfig(
             name=run_name,
             scan=model_cfg["scan"],
+            flow_steps=500,
         )
         model = model_cache[model_name]
         transcoded_outputs = model([prompt] * config.batch_size)
@@ -70,47 +87,75 @@ def generate(session, run_name, model_name, prompt):
             from_thread.run(task_creator)
         return html, str(circuit_path)
 
-def upload_to_neuronpedia(circuit_file, neuronpedia_api_key):
-    circuit_file = Path(circuit_file)
-    circuit_name = circuit_file.name
-    circuit_text = circuit_file.read_text().encode("utf-8")
-    auth_headers = {
-        "X-API-Key": neuronpedia_api_key
-    }
-    signed_put = requests.post(
-        "https://www.neuronpedia.org/api/graph/signed-put",
-        headers={
-            "Content-Type": "application/json",
-            **auth_headers
-        },
-        json={
-            "filename": circuit_name,
-            "contentLength": len(circuit_text),
-            "contentType": "application/json"
-        }
-    ).json()
-    url, put_request_id = signed_put["url"], signed_put["putRequestId"]
-    requests.put(
-        url,
-        data=circuit_text,
-    )
-    put_response = requests.post(
-        "https://www.neuronpedia.org/api/graph/save-to-db",
-        headers={
-            "Content-Type": "application/json",
-            **auth_headers
-        },
-        json={
-            "putRequestId": put_request_id
-        }
-    ).json()
-    if "error" in put_response:
-        return f"Error: {put_response['error']}"
-    result_url = put_response["url"]
-    return f"Uploaded to Neuronpedia: {result_url}"
+def upload_to_neuronpedia(circuit_file, model_name, neuronpedia_api_key):
+    with neuronpedia.api_key(neuronpedia_api_key):
+        model_cfg = [x for x in MODEL_OPTIONS if x["model_name"] == model_name][0]
+        model_id = model_cfg["model_id"]
+        try:
+            NPModel.new(
+                id=model_id,
+                layers=model_cfg["num_layers"],
+                display_name=model_cfg["model_name"],
+            )
+        except (requests.exceptions.HTTPError, neuronpedia.requests.base_request.NPRateLimitError):
+            traceback.print_exc()
+
+        try:
+            SourceSet.new(
+                model_id=model_id,
+                name=model_cfg["scan"],
+            )
+        except requests.exceptions.HTTPError:
+            traceback.print_exc()
+        source_set = SourceSet.get(model_id=model_id, name=model_cfg["scan"])
+        features_by_source = defaultdict(list)
+        sources = {}
+        for feature_path in (Path(SAVE_DIR) / "features" / model_cfg["scan"]).glob("*.json"):
+            feature_json = json.loads(feature_path.read_text())
+            index = feature_json["index"]
+            layer, feature = cantor_decode(index)
+            source = source_set.get_source_for_layer_number(layer_number=layer)
+            if source.id not in sources:
+                sources[source.id] = source
+            activations = []
+            for quantile in feature_json.get("examples_quantiles", []):
+                for example in quantile["examples"]:
+                    activation = Activation(
+                        modelId = model_cfg["model_name"],
+                        source=source.id,
+                        index=feature,
+                        tokens=example["tokens"],
+                        values=example["tokens_acts_list"],
+                    )
+                    activations.append(activation)
+            feature = Feature(
+                modelId = model_cfg["model_name"],
+                source=source.id,
+                index=feature,
+                activations=activations,
+                density=0.0,
+            )
+            if activations:
+                features_by_source[source.id].append(feature)
+
+        for source_id, features in features_by_source.items():
+            source = sources[source_id]
+            print("Source", source_id, "has", len(features), "features")
+            try:
+                source.upload_batch(
+                    features=features,
+                )
+            except requests.exceptions.HTTPError:
+                traceback.print_exc()
+
+        circuit_file = Path(circuit_file)
+        circuit_text = circuit_file.read_text()
+        graph_metadata = NPGraphMetadata.upload(circuit_text)
+        result_url = graph_metadata.url
+        return f"Uploaded to Neuronpedia: {result_url}"
 
 def update_logs(session):
-    if not session["something_is_running"]:
+    if not (session or {}).get("something_is_running"):
         return ""
     with open(session["log_file"].name, "r") as f:
         logs = f.read()
@@ -124,11 +169,11 @@ def main():
         gr.Markdown("&lt;colab link&gt;")
         gr.Markdown("Input text and get an attribution graph")
 
-        run_name = gr.Textbox(label="Run name", value="gpt2-basketball")
+        run_name = gr.Textbox(label="Run name", value="llama-basketball")
         model_dropdown = gr.Dropdown(label="Model", choices=[x["model_name"] for x in MODEL_OPTIONS],
                                      value=MODEL_OPTIONS[0]["model_name"],
                                      interactive=False)
-        prompt = gr.Textbox(label="Prompt", value="<|endoftext|>What sport does Michael Jordan play? Michael Jordan plays the sport of")
+        prompt = gr.Textbox(label="Prompt", value="What sport does Michael Jordan play? Michael Jordan plays the sport of")
 
         # with gr.Group():
         #     gr.Markdown("## Settings")
@@ -171,7 +216,7 @@ def main():
         neuronpedia_api_key.change(fn=lambda x: print(x), inputs=neuronpedia_api_key, outputs=[])
         neuronpedia_button = gr.Button("Upload to Neuronpedia")
         neuronpedia_result = gr.Markdown()
-        neuronpedia_button.click(upload_to_neuronpedia, inputs=[circuit_file, neuronpedia_api_key], outputs=neuronpedia_result)
+        neuronpedia_button.click(upload_to_neuronpedia, inputs=[circuit_file, model_dropdown, neuronpedia_api_key], outputs=neuronpedia_result)
 
         inputs = [
             session,
@@ -193,6 +238,7 @@ def main():
     return ui
 
 
-ui = main()
-ui.launch(share=True,)
-demo = ui
+if __name__ == "__main__":
+    ui = main()
+    ui.launch(share=True,)
+    demo = ui
