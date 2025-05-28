@@ -39,8 +39,7 @@ pytorch-triton = [
     { index = "pytorch" }
 ]
 
-# eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
-eai-delphi = { path = "../delphi", editable = true }
+eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
 # eai-sparsify = { path = "../e2e", editable = true }
 eai-sparsify = { git = "https://github.com/EleutherAI/sparsify", branch="clt" }
 
