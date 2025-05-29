@@ -306,6 +306,7 @@ class AttributionGraph:
         filtered_index = np.cumsum(filtered_mask) - 1
 
         filtered_adj_matrix = original_adj_matrix[filtered_mask][:, filtered_mask]
+        # orig_filtered_adj_matrix = filtered_adj_matrix
         filtered_influence, filtered_adj_matrix = self.find_influence(filtered_adj_matrix, activation_sources[filtered_mask])
         filtered_node_influence = influence_sources[filtered_mask] @ filtered_influence
         filtered_influence = filtered_adj_matrix * (filtered_node_influence + influence_sources[filtered_mask])[None, :]
@@ -329,7 +330,9 @@ class AttributionGraph:
         if DEBUG:
             edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
             pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
-            edge_scores = pruned_matrix["edge_scores"].cpu()
+            # edge_scores = pruned_matrix["normalized_pruned"].cpu()
+            edge_scores = pruned_matrix["pruned_matrix"].cpu()
+            # edge_scores = pruned_matrix["edge_scores"].cpu()
             xs = []
             ys = []
             for i, (layer_idx_0, seq_idx_0, feature_idx_0) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
@@ -349,13 +352,17 @@ class AttributionGraph:
                     if source_idx < 0 or target_idx < 0:
                         continue
                     xs.append(score)
-                    ys.append(filtered_influence[source_idx, target_idx])
+                    # ys.append(filtered_influence[source_idx, target_idx])
+                    # ys.append(filtered_adj_matrix[source_idx, target_idx])
+                    # ys.append(orig_filtered_adj_matrix[source_idx, target_idx])
+                    ys.append(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]])
                     # print()
                     # print(i, j, score)
                     # print(source_idx, target_idx)
                     # print(filtered_influence[source_idx, target_idx])
             from matplotlib import pyplot as plt
-            plt.scatter(xs, ys)
+            plt.scatter(xs, ys, s=1)
+            plt.plot([1e-5, 1], [1e-5, 1], color="black")
             plt.xscale("log")
             plt.yscale("log")
             plt.xlabel("Theirs")
