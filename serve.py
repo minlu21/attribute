@@ -17,7 +17,7 @@ import neuronpedia
 from neuronpedia.np_graph_metadata import NPGraphMetadata
 from neuronpedia.np_model import Model as NPModel
 from neuronpedia.np_source_set import SourceSet
-from neuronpedia.np_feature import Feature
+from neuronpedia.np_feature import Feature, Logit as NPLogit
 from neuronpedia.np_activation import Activation
 import neuronpedia.requests.base_request
 import torch
@@ -149,11 +149,15 @@ def upload_to_neuronpedia(circuit_file, model_name, neuronpedia_api_key):
                         values=example["tokens_acts_list"],
                     )
                     activations.append(activation)
+            top_logits = [NPLogit(token=token, value=value) for token, value in zip(feature_json["top_logits"], feature_json.get("top_logit_values", [0] * len(feature_json["top_logits"])))]
+            bottom_logits = [NPLogit(token=token, value=value) for token, value in zip(feature_json["bottom_logits"], feature_json.get("bottom_logit_values", [0] * len(feature_json["bottom_logits"])))]
             feature = Feature(
                 modelId = model_cfg["model_name"],
                 source=source.id,
                 index=feature,
                 activations=activations,
+                top_logits=top_logits,
+                bottom_logits=bottom_logits,
                 density=0.0,
             )
             if activations:
