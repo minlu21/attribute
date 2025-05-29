@@ -115,7 +115,6 @@ class TranscodedModel(object):
                     transcoder_path / temp_hookpoint,
                     device=device,
                 )
-            sae = sae.to(torch.bfloat16)
             sae.requires_grad_(False)
             self.transcoders[hookpoint] = sae
         self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
