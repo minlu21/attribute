@@ -63,6 +63,4 @@ ngrok http 9999
 ```
 
 ## TODOs
-- [ ] Optimize VRAM usage
-- [ ] Upload all transcoders
 - [ ] Cross-verify with Anthropic implementation
