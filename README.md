@@ -39,7 +39,7 @@ uv run gradio serve.py
 
 ## Colab (WIP)
 
-The web UI can be run from [a Colab notebook](https://colab.research.google.com/github/EleutherAI/attribute/blob/main/serve.ipynb). For running the Llama transcoder, it requires an A100 runtime. We are actively working on optimizing this.
+The web UI can be run from [a Colab notebook](https://colab.research.google.com/github/EleutherAI/attribute/blob/main/serve.ipynb).
 
 ## Run in CLI
 
@@ -55,6 +55,7 @@ uv run python -m attribute \
 --transcoder_path="nev/SmolLM2-CLT-135M-73k-k32" --model_name="HuggingFaceTB/SmolLM2-135M" \
 ```
 
+```
 uv run python -m attribute
 cd attribution-graphs-frontend
 uv run python serve.py 9999

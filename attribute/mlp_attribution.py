@@ -44,8 +44,7 @@ class AttributionConfig:
     filter_high_freq_early: float = 0.01
 
     # remove MLP edges below this threshold
-    # pre_filter_threshold: float = 1e-3
-    pre_filter_threshold: float = 1e-10
+    pre_filter_threshold: float = 1e-5
     # keep edges that make up this fraction of the total influence
     edge_cum_threshold: float = 0.98
     # keep top k edges for each node
@@ -54,7 +53,7 @@ class AttributionConfig:
     # whether to multiply by activation strength before computing influence
     influence_anthropic: bool = True
     # whether to compute influence on the GPU
-    influence_gpu: bool = False
+    influence_gpu: bool = True
     # keep nodes that make up this fraction of the total influence
     node_cum_threshold: float = 0.8
     # keep per_layer_position nodes above this threshold for each layer/position pair
@@ -527,7 +526,7 @@ class AttributionGraph:
                 with torch.no_grad(), torch.autocast("cuda"):
                     try:
                         logger.disable("attribute.caching")
-                        dec_weight = self.model.w_dec(layer)[feature]
+                        dec_weight = self.model.w_dec_i(layer, feature)
                     finally:
                         logger.enable("attribute.caching")
                     logits = logit_weight @ dec_weight
@@ -568,8 +567,8 @@ class AttributionGraph:
     @torch.inference_mode()
     def self_explain_feature(self, node: IntermediateNode):
         layer, feature = node.layer_index, node.feature_index
-        w_dec = self.model.w_dec(layer, use_skip=True)[feature]
-        w_enc = self.model.w_enc(layer)[feature]
+        w_dec = self.model.w_dec_i(layer, feature, use_skip=True)
+        w_enc = self.model.w_enc_i(layer, feature)
         strengths = torch.linspace(self.config.selfe_min_strength, self.config.selfe_max_strength, self.config.selfe_n, device=self.model.device)
         w_dec = w_dec[None, :] * strengths[:, None]
         w_enc = w_enc[None, :] * strengths[:, None]
@@ -761,14 +760,13 @@ class AttributionGraph:
                 zip(activations_tensor.tolist(), indices_tensor.tolist())
             ):
                 for k_index, (act, index) in enumerate(zip(top_acts, top_indices)):
-                    encoder_direction = self.model.w_enc(layer)[index]
                     intermediate_node = IntermediateNode(
                         id=f"intermediate_{token_position}_{layer}_{index}",
                         layer_index=layer,
                         feature_index=index,
                         token_position=token_position,
                         activation=float(act),
-                        input_vector=encoder_direction.to(dtype=torch.bfloat16),
+                        input_vector=None,
                     )
                     self.nodes[intermediate_node.id] = intermediate_node
                     self.nodes_by_layer_and_token[layer][token_position].append(

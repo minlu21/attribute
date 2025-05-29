@@ -20,9 +20,20 @@ from neuronpedia.np_source_set import SourceSet
 from neuronpedia.np_feature import Feature
 from neuronpedia.np_activation import Activation
 import neuronpedia.requests.base_request
+import torch
 
 
+torch._functorch.config.donated_buffer=False
 MODEL_OPTIONS = [
+    dict(model_name="meta-llama/Llama-3.2-1B",
+         model_id="llama3.1-8b",
+        #  transcoder_path="EleutherAI/skip-transcoder-llama-3.2-1b-128x",
+         transcoder_path="nev/Llama-3.2-1B-mntss-skip-transcoder",
+         cache_path="results/transcoder-llama-131k-mntss/latents",
+         scan="transcoder-llama-131k-adam-kl",
+         remove_prefix=1,
+         num_layers=16,
+         hook_resid_mid=True),
     dict(model_name="HuggingfaceTB/SmolLM2-135M",
          model_id="smollm2-135m",
          transcoder_path="nev/SmolLM2-CLT-135M-73k-k32",
@@ -31,14 +42,6 @@ MODEL_OPTIONS = [
          remove_prefix=0,
          num_layers=30,
     ),
-    dict(model_name="meta-llama/Llama-3.2-1B",
-         model_id="llama3.1-8b",
-        #  transcoder_path="EleutherAI/skip-transcoder-llama-3.2-1b-128x",
-         transcoder_path="nev/Llama-3.2-1B-mntss-skip-transcoder",
-         cache_path="results/transcoder-llama-131k-mntss/latents",
-         scan="transcoder-llama-131k-adam-kl",
-         remove_prefix=1,
-         num_layers=16),
     # dict(model_name="gpt2",
     #      model_id="gpt2",
     #      transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/clt-gpt2/const-k16",
@@ -48,6 +51,7 @@ MODEL_OPTIONS = [
     #      num_layers=12),
 ]
 SAVE_DIR = "attribution-graphs-frontend"
+OFFLOAD_TRANSCODER = os.environ.get("OFFLOAD_TRANSCODER", "") == "1"
 static_paths = [SAVE_DIR]
 for model in MODEL_OPTIONS:
     static_paths.append(os.path.join(SAVE_DIR, "features", model["scan"]))
@@ -60,11 +64,10 @@ except NameError:
 running_contexts = set()
 default_config = AttributionConfig(
     flow_steps=500,
-    batch_size=1,
     name=None,
     scan=None,
 )
-DEFAULT_RUN_NAME = "smollm-basketball"
+DEFAULT_RUN_NAME = "smollm-basketball" if "smollm" in MODEL_OPTIONS[0]["model_name"] else "llama-basketball"
 
 def initialize(request: gr.Request):
     session_hash = request.session_hash
@@ -78,7 +81,13 @@ def generate(session, run_name, model_name, prompt):
         session["log_file"].truncate(0)
         model_cfg = [x for x in MODEL_OPTIONS if x["model_name"] == model_name][0]
         if model_name not in model_cache:
-            model_cache[model_name] = TranscodedModel(model_cfg["model_name"], model_cfg["transcoder_path"], device="cuda")
+            model_cache[model_name] = TranscodedModel(
+                model_cfg["model_name"],
+                model_cfg["transcoder_path"],
+                device="cuda",
+                offload=OFFLOAD_TRANSCODER,
+                pre_ln_hook=model_cfg.get("hook_resid_mid", False),
+            )
         config = replace(default_config, name=run_name, scan=model_cfg["scan"])
         model = model_cache[model_name]
         transcoded_outputs = model([prompt] * config.batch_size)

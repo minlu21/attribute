@@ -1,3 +1,4 @@
+import gc
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -72,6 +73,7 @@ class TranscodedModel(object):
         hookpoint_fn=None,
         device="cuda",
         pre_ln_hook: bool = False,
+        offload: bool = False,
     ):
         logger.info(f"Loading model {model_name} on device {device}")
         self.device = device
@@ -84,6 +86,7 @@ class TranscodedModel(object):
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = model
         self.tokenizer = tokenizer
+        self.offload = offload
 
         if transcoder_path is None:
             return
@@ -103,7 +106,10 @@ class TranscodedModel(object):
         logger.info(f"Loading transcoders from {transcoder_path}")
         transcoder_path = Path(transcoder_path)
         self.transcoders = {}
-        for hookpoint, temp_hookpoint in zip(self.hookpoints_mlp, self.temp_hookpoints_mlp):
+        self.transcoder_loaders = {}
+        self.offloaded_encoder_indices = {}
+        self.offloaded_decoder_indices = {}
+        def load_transcoder(hookpoint, temp_hookpoint):
             if not transcoder_path.joinpath(temp_hookpoint).exists():
                 sae = SparseCoder.load_from_hub(
                     str(transcoder_path),
@@ -117,6 +123,12 @@ class TranscodedModel(object):
                 )
             sae.requires_grad_(False)
             self.transcoders[hookpoint] = sae
+        for hookpoint, temp_hookpoint in zip(self.hookpoints_mlp, self.temp_hookpoints_mlp):
+            loader = partial(load_transcoder, hookpoint, temp_hookpoint)
+            if offload:
+                self.transcoder_loaders[hookpoint] = loader
+            else:
+                loader()
         self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
         self.hookpoints_ln = [f"{self.layer_prefix}.{i}.{self.mlp_layernorm_name}" for i in range(self.num_layers)]
         self.hookpoints_attn_ln = [f"{self.layer_prefix}.{i}.{self.attn_layernorm_name}" for i in range(self.num_layers)]
@@ -205,12 +217,32 @@ class TranscodedModel(object):
             if self.pre_ln_hook:
                 input = resid_mid[layer_idx]
 
+            if self.offload:
+                if module_name in self.transcoders:
+                    del self.transcoders[module_name]
+                self.transcoder_loaders[module_name]()
             transcoder = self.transcoders[module_name]
             # have to reshape input to lose the batch dimension
             batch_dims = input.shape[:-1]
             input = input.view(-1, input.shape[-1])
-            # have to normalize input
-            transcoder_acts = runner.encode(input, transcoder)
+            with torch.set_grad_enabled(not self.offload):
+                transcoder_acts = runner.encode(input, transcoder)
+            if self.offload:
+                with torch.no_grad():
+                    unique_ids = torch.unique(transcoder_acts.latent_indices.view(-1))
+                    self.offloaded_encoder_indices[layer_idx] = unique_ids.tolist()
+                    remapped_indices = (transcoder_acts.latent_indices[..., None] == unique_ids).int().argmax(dim=-1)
+                    transcoder.encoder.weight.data = transcoder.encoder.weight.data[unique_ids].clone()
+                    transcoder.encoder.bias.data = transcoder.encoder.bias.data[unique_ids].clone()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                second_acts = runner.encode(input, transcoder)
+                with torch.no_grad():
+                    matching_indices = remapped_indices[..., :, None] == second_acts.latent_indices[..., None, :]
+                    source_index = matching_indices.half().argmax(dim=-1)
+                    has_match = torch.any(matching_indices, dim=-1)
+                gathered_acts = torch.gather(second_acts.latent_acts, dim=-1, index=source_index) * has_match.float()
+                transcoder_acts.latent_acts = gathered_acts
 
             masked_features = mask_features.get(layer_idx, [])
             steered_features = steer_features.get(layer_idx, [])
@@ -255,7 +287,21 @@ class TranscodedModel(object):
             flat_source_acts = source_latent_acts.flatten(0, -2)
             transcoder_acts.latent_acts = flat_source_acts
 
-            outputs = runner.decode(transcoder_acts, None, module_name)
+            with torch.set_grad_enabled(not self.offload):
+                outputs = runner.decode(transcoder_acts, None, module_name, advance=not self.offload)
+            if self.offload:
+                with torch.no_grad():
+                    unique_decoder_indices = torch.unique(outputs.latent_indices.view(-1))
+                    self.offloaded_decoder_indices[layer_idx] = unique_decoder_indices.tolist()
+                    transcoder.W_dec.data = transcoder.W_dec.data[unique_decoder_indices]
+                    original_fn = transcoder.decode
+                    def decode_remapped(top_acts, top_indices, *args, **kwargs):
+                        remapped_indices = (top_indices[..., None] == unique_decoder_indices).int().argmax(dim=-1)
+                        return original_fn(top_acts, remapped_indices, *args, **kwargs)
+                    transcoder.decode = decode_remapped
+                outputs = runner.decode(transcoder_acts, None, module_name)
+                gc.collect()
+                torch.cuda.empty_cache()
             sae_out = outputs.sae_out
 
             # have to reshape output to get the batch dimension back
@@ -466,6 +512,19 @@ class TranscodedModel(object):
             except AttributeError:
                 raise IndexError
 
+    @torch.no_grad()
+    @torch.autocast("cuda")
+    def w_dec_i(self, layer_idx: int, i: int, target_layer_idx: int | None = None, use_skip: bool = False) -> Float[Array, "hidden_size"]:
+        sparse_coder = self.transcoders[self.hookpoints_mlp[layer_idx]]
+        if self.offload:
+            if use_skip:
+                logger.warning("Skipping weights are not supported when offloading")
+            if not hasattr(sparse_coder, "W_dec"):
+                raise NotImplementedError("Multiple decoder weights are not supported when offloading")
+            W_dec = list(sparse_coder.W_dec)
+            offloaded_decoder_indices = self.offloaded_decoder_indices[layer_idx]
+            return W_dec[offloaded_decoder_indices.index(i)]
+        return self.w_dec(layer_idx, target_layer_idx, use_skip)[i]
     def w_skip(self, layer_idx: int, target_layer_idx: int | None = None) -> Float[Array, "hidden_size hidden_size"]:
         transcoder = self.transcoders[self.hookpoints_mlp[layer_idx]]
         try:
@@ -486,7 +545,16 @@ class TranscodedModel(object):
             return transcoder.W_skip
 
     def w_enc(self, layer_idx: int) -> Float[Array, "features hidden_size"]:
-        return self.transcoders[self.hookpoints_mlp[layer_idx]].encoder.weight
+        transcoder = self.transcoders[self.hookpoints_mlp[layer_idx]]
+        W_enc = transcoder.encoder.weight
+        return W_enc
+
+    def w_enc_i(self, layer_idx: int, i: int) -> Float[Array, "features hidden_size"]:
+        W_enc = self.w_enc(layer_idx)
+        if self.offload:
+            offloaded_encoder_indices = self.offloaded_encoder_indices[layer_idx]
+            return W_enc[offloaded_encoder_indices.index(i)]
+        return W_enc[i]
 
     def get_layer(self, layer_idx: int) -> torch.nn.Module:
         return self.model.get_submodule(self.layer_prefix)[layer_idx]
