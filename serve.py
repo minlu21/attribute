@@ -1,5 +1,6 @@
 from attribute import TranscodedModel, AttributionConfig, AttributionGraph
 from attribute.utils import cantor_decode
+from dataclasses import replace
 import gradio as gr
 import traceback
 from loguru import logger
@@ -22,21 +23,29 @@ import neuronpedia.requests.base_request
 
 
 MODEL_OPTIONS = [
+    dict(model_name="HuggingfaceTB/SmolLM2-135M",
+         model_id="smollm2-135m",
+         transcoder_path="nev/SmolLM2-CLT-135M-73k-k32",
+         cache_path="results/smollm-v1/latents",
+         scan="smollm-v1",
+         remove_prefix=0,
+         num_layers=30,
+    ),
     dict(model_name="meta-llama/Llama-3.2-1B",
          model_id="llama3.1-8b",
         #  transcoder_path="EleutherAI/skip-transcoder-llama-3.2-1b-128x",
-         transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/llama-finetune/adam",
-         cache_path="results/transcoder-llama-131k-adam-kl/latents",
+         transcoder_path="nev/Llama-3.2-1B-mntss-skip-transcoder",
+         cache_path="results/transcoder-llama-131k-mntss/latents",
          scan="transcoder-llama-131k-adam-kl",
          remove_prefix=1,
          num_layers=16),
-    dict(model_name="gpt2",
-         model_id="gpt2",
-         transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/clt-gpt2/const-k16",
-         cache_path="results/transcoder_gpt2_128x_const_k16_ft_v0/latents",
-         scan="gpt2-128x-const-k16-ft-v0",
-         remove_prefix=1,
-         num_layers=12),
+    # dict(model_name="gpt2",
+    #      model_id="gpt2",
+    #      transcoder_path="/mnt/ssd-1/nev/sparsify/checkpoints/clt-gpt2/const-k16",
+    #      cache_path="results/transcoder_gpt2_128x_const_k16_ft_v0/latents",
+    #      scan="gpt2-128x-const-k16-ft-v0",
+    #      remove_prefix=1,
+    #      num_layers=12),
 ]
 SAVE_DIR = "attribution-graphs-frontend"
 static_paths = [SAVE_DIR]
@@ -49,6 +58,13 @@ try:
 except NameError:
     model_cache = {}
 running_contexts = set()
+default_config = AttributionConfig(
+    flow_steps=500,
+    batch_size=1,
+    name=None,
+    scan=None,
+)
+DEFAULT_RUN_NAME = "smollm-basketball"
 
 def initialize(request: gr.Request):
     session_hash = request.session_hash
@@ -63,11 +79,7 @@ def generate(session, run_name, model_name, prompt):
         model_cfg = [x for x in MODEL_OPTIONS if x["model_name"] == model_name][0]
         if model_name not in model_cache:
             model_cache[model_name] = TranscodedModel(model_cfg["model_name"], model_cfg["transcoder_path"], device="cuda")
-        config = AttributionConfig(
-            name=run_name,
-            scan=model_cfg["scan"],
-            flow_steps=500,
-        )
+        config = replace(default_config, name=run_name, scan=model_cfg["scan"])
         model = model_cache[model_name]
         transcoded_outputs = model([prompt] * config.batch_size)
         transcoded_outputs.remove_prefix(model_cfg["remove_prefix"])
@@ -166,38 +178,14 @@ def main():
         session = gr.State(None)
 
         gr.Markdown("# Attribution Graphs")
-        gr.Markdown("&lt;colab link&gt;")
+        gr.Markdown("[Open in Colab](https://colab.research.google.com/github/EleutherAI/attribute/blob/main/serve.ipynb)")
         gr.Markdown("Input text and get an attribution graph")
 
-        run_name = gr.Textbox(label="Run name", value="llama-basketball")
+        run_name = gr.Textbox(label="Run name", value=DEFAULT_RUN_NAME)
         model_dropdown = gr.Dropdown(label="Model", choices=[x["model_name"] for x in MODEL_OPTIONS],
                                      value=MODEL_OPTIONS[0]["model_name"],
-                                     interactive=False)
+                                     interactive=True)
         prompt = gr.Textbox(label="Prompt", value="What sport does Michael Jordan play? Michael Jordan plays the sport of")
-
-        # with gr.Group():
-        #     gr.Markdown("## Settings")
-        #     inputs = []
-        #     defaults = []
-        #     with gr.Tabs():
-        #         for name, section in []:
-        #             with gr.TabItem(name):
-        #                 for k, v0, t in section:
-        #                     if t in (float, int):
-        #                         element = gr.Number(label=k, value=v0)
-        #                     elif t == str:
-        #                         element = gr.Textbox(label=k, value=v0)
-        #                     elif t == bool:
-        #                         element = gr.Checkbox(label=k, value=v0)
-        #                     elif isinstance(t, tuple):
-        #                         element = gr.Slider(*t, label=k, value=v0)
-        #                     elif isinstance(t, list):
-        #                         element = gr.Dropdown(label=k, value=v0, choices=t)
-        #                     else:
-        #                         raise TypeError(f"Input format {t} should be one of str, int, bool, tuple, list")
-        #                         element = 1/0
-        #                     inputs.append(element)
-        #                     defaults.append(v0)
 
         button = gr.Button("Run")
         gr.Markdown("## Result")

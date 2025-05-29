@@ -20,6 +20,9 @@ from .nodes import (Contribution, Edge, ErrorNode, InputNode, IntermediateNode,
 from .utils import cantor, measure_time
 
 
+DEBUG = os.environ.get("ATTRIBUTE_DEBUG", "0") == "1"
+
+
 @dataclass
 class AttributionConfig:
     # name of the run
@@ -180,6 +183,18 @@ class AttributionGraph:
             node = self.nodes[node]
             if isinstance(node, OutputNode):
                 influence_sources[index] = node.probability
+
+        if DEBUG:
+            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
+            logit_weights = edge_matrix["logit_weights"].tolist()
+            logit_tokens = edge_matrix["logit_tokens"].tolist()
+            for index, node in enumerate(dedup_node_names):
+                node = self.nodes[node]
+                if isinstance(node, OutputNode):
+                    output_id = node.token_idx
+                    logit_idx = logit_tokens.index(output_id)
+                    influence_sources[index] = logit_weights[logit_idx]
+
         activation_sources = np.ones((n_initial,))
         for index, node in enumerate(dedup_node_names):
             node = self.nodes[node]
@@ -199,45 +214,45 @@ class AttributionGraph:
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
 
-        # if False:
-        #     edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
-        #     logit_weights = edge_matrix["logit_weights"]
+        if DEBUG:
+            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
+            logit_weights = edge_matrix["logit_w"]
 
-        #     def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
-        #         normalized = matrix.abs()
-        #         return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
+            def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
+                normalized = matrix.abs()
+                return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
 
-        #     def compute_influence(A):
-        #         # Calculate total influence using matrix inverse (I - A)^-1 - I
-        #         I = torch.eye(A.shape[0], device=A.device)
-        #         B = torch.inverse(I - A) - I
-        #         return logit_weights @ B
+            def compute_influence(A):
+                # Calculate total influence using matrix inverse (I - A)^-1 - I
+                identity = torch.eye(A.shape[0], device=A.device)
+                B = torch.inverse(identity - A) - identity
+                return logit_weights @ B.to(logit_weights.device)
 
-        #     # Calculate node influence and apply threshold
-        #     node_influence = compute_influence(normalize_matrix(edge_matrix["edge_matrix"]))
+            # Calculate node influence and apply threshold
+            node_influence = compute_influence(normalize_matrix(edge_matrix["edge_matrix"]))
 
-        #     xs = []
-        #     ys = []
-        #     for i, (layer_idx, seq_idx, feature_idx) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
-        #         seq_idx = seq_idx - 1
-        #         try:
-        #             node_id = self.intermediate_nodes[(seq_idx, layer_idx, feature_idx)].id
-        #         except KeyError:
-        #             continue
-        #         try:
-        #             print(dedup_node_indices[node_id])
-        #         except KeyError:
-        #             continue
-        #         xs.append(node_influence[i].item())
-        #         ys.append(usage[dedup_node_indices[node_id]])
-        #     from matplotlib import pyplot as plt
-        #     plt.scatter(xs, ys)
-        #     plt.plot([0, 0.05], [0, 0.05], color="black")
-        #     plt.xlabel("Theirs")
-        #     plt.ylabel("Ours")
-        #     plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1]**2:.3f}")
-        #     plt.savefig("results/influence_vs_usage.png")
-        #     # 1/0
+            xs = []
+            ys = []
+            for i, (layer_idx, seq_idx, feature_idx) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
+                seq_idx = seq_idx - 1
+                try:
+                    node_id = self.intermediate_nodes[(seq_idx, layer_idx, feature_idx)].id
+                except KeyError:
+                    continue
+                try:
+                    dedup_node_indices[node_id]
+                except KeyError:
+                    continue
+                xs.append(node_influence[i].item())
+                ys.append(usage[dedup_node_indices[node_id]])
+            from matplotlib import pyplot as plt
+            plt.scatter(xs, ys)
+            plt.plot([0, 0.05], [0, 0.05], color="black")
+            plt.xlabel("Theirs")
+            plt.ylabel("Ours")
+            plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1]**2:.3f}")
+            plt.savefig("results/influence_vs_usage.png")
+            plt.close()
 
         logger.info("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
@@ -296,11 +311,49 @@ class AttributionGraph:
         edge_cumsum = np.cumsum(selected_edge_matrix)
         edge_cumsum = edge_cumsum / edge_cumsum[-1]
 
-        # from matplotlib import pyplot as plt
-        # plt.loglog(1 - edge_cumsum)
-        # plt.plot([0, 10000], [0.02, 0.02], "k--")
-        # plt.savefig("results/edge_cumsum.png")
+        if DEBUG:
+            from matplotlib import pyplot as plt
+            plt.loglog(1 - edge_cumsum)
+            plt.plot([0, 10000], [0.02, 0.02], "k--")
+            plt.savefig("results/edge_cumsum.png")
+            plt.close()
 
+        if DEBUG:
+            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
+            pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
+            edge_scores = pruned_matrix["edge_scores"].cpu()
+            xs = []
+            ys = []
+            for i, (layer_idx_0, seq_idx_0, feature_idx_0) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
+                for j, (layer_idx_1, seq_idx_1, feature_idx_1) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
+                    seq_idx = seq_idx - 1
+                    score = float(edge_scores[i, j])
+                    if score == 0:
+                        continue
+                    if (seq_idx_0, layer_idx_0, feature_idx_0) not in self.intermediate_nodes:
+                        continue
+                    if (seq_idx_1, layer_idx_1, feature_idx_1) not in self.intermediate_nodes:
+                        continue
+                    source_id = self.intermediate_nodes[(seq_idx_0, layer_idx_0, feature_idx_0)].id
+                    target_id = self.intermediate_nodes[(seq_idx_1, layer_idx_1, feature_idx_1)].id
+                    source_idx = filtered_index[dedup_node_indices[source_id]]
+                    target_idx = filtered_index[dedup_node_indices[target_id]]
+                    if source_idx < 0 or target_idx < 0:
+                        continue
+                    xs.append(score)
+                    ys.append(filtered_influence[source_idx, target_idx])
+                    # print()
+                    # print(i, j, score)
+                    # print(source_idx, target_idx)
+                    # print(filtered_influence[source_idx, target_idx])
+            from matplotlib import pyplot as plt
+            plt.scatter(xs, ys)
+            plt.xscale("log")
+            plt.yscale("log")
+            plt.xlabel("Theirs")
+            plt.ylabel("Ours")
+            plt.savefig("results/influence_vs_score.png")
+            plt.close()
         edge_threshold = selected_edge_matrix[np.searchsorted(edge_cumsum, self.config.edge_cum_threshold)]
         logger.info(f"Edge threshold: {edge_threshold}")
 

@@ -34,6 +34,7 @@ class MLPOutputs:
 @dataclass
 class TranscodedOutputs:
     input_ids: Int[Array, "batch seq_len"]
+    original_input_ids: Int[Array, "batch seq_len"]
     mlp_outputs: dict[int, MLPOutputs]
     last_layer_activations: Float[Array, "batch seq_len hidden_size"]
     first_layer_activations: Float[Array, "batch seq_len hidden_size"]
@@ -49,7 +50,6 @@ class TranscodedOutputs:
 
     def remove_prefix(self, remove_prefix: int):
         if remove_prefix > 0:
-            self.original_input_ids = self.input_ids
             self.input_ids = self.input_ids[:, remove_prefix:]
             # only ever accessed w/ [-1], removing BOS doesn't matter
             # transcoded_outputs.last_layer_activations = transcoded_outputs.last_layer_activations[:, 1:]
@@ -115,6 +115,7 @@ class TranscodedModel(object):
                     transcoder_path / temp_hookpoint,
                     device=device,
                 )
+            sae = sae.to(torch.bfloat16)
             sae.requires_grad_(False)
             self.transcoders[hookpoint] = sae
         self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
@@ -321,6 +322,7 @@ class TranscodedModel(object):
 
         transcoded_outputs = TranscodedOutputs(
             input_ids=tokenized_prompt.input_ids,
+            original_input_ids=tokenized_prompt.input_ids,
             mlp_outputs=mlp_outputs,
             first_layer_activations=first_layer_activations,
             last_layer_activations=last_layer_activations,
