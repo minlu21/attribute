@@ -45,7 +45,7 @@ class AttributionConfig:
 
     # remove MLP edges below this threshold
     # pre_filter_threshold: float = 1e-3
-    pre_filter_threshold: float = 0.0
+    pre_filter_threshold: float = 1e-10
     # keep edges that make up this fraction of the total influence
     edge_cum_threshold: float = 0.98
     # keep top k edges for each node
@@ -53,6 +53,8 @@ class AttributionConfig:
     top_k_edges: int = 1024
     # whether to multiply by activation strength before computing influence
     influence_anthropic: bool = True
+    # whether to compute influence on the GPU
+    influence_gpu: bool = False
     # keep nodes that make up this fraction of the total influence
     node_cum_threshold: float = 0.8
     # keep per_layer_position nodes above this threshold for each layer/position pair
@@ -149,12 +151,19 @@ class AttributionGraph:
             latents=module_latents,
         )
 
+    @torch.inference_mode()
     def find_influence(self, adj_matrix: np.ndarray, activation_sources: np.ndarray):
         n_initial = adj_matrix.shape[0]
         if self.config.influence_anthropic:
             adj_matrix = np.abs(adj_matrix) * activation_sources
             adj_matrix = adj_matrix / np.maximum(1e-5, adj_matrix.sum(axis=1, keepdims=True))
-            influence = np.linalg.inv(np.eye(n_initial) - adj_matrix) - np.eye(n_initial)
+            if self.config.influence_gpu:
+                adj_gpu = torch.from_numpy(adj_matrix).to(self.model.device)
+                identity = torch.eye(n_initial, device=self.model.device)
+                influence = torch.inverse(identity - adj_gpu) - identity
+                influence = influence.cpu().numpy()
+            else:
+                influence = np.linalg.inv(np.eye(n_initial) - adj_matrix) - np.eye(n_initial)
         else:
             influence = np.linalg.inv(np.eye(n_initial) - adj_matrix) - np.eye(n_initial)
             influence = np.abs(influence) * activation_sources
