@@ -26,11 +26,11 @@ import torch
 torch._functorch.config.donated_buffer=False
 MODEL_OPTIONS = [
     dict(model_name="meta-llama/Llama-3.2-1B",
-         model_id="llama3.1-8b",
+         model_id="llama3.2-1b",
         #  transcoder_path="EleutherAI/skip-transcoder-llama-3.2-1b-128x",
          transcoder_path="nev/Llama-3.2-1B-mntss-skip-transcoder",
          cache_path="results/transcoder-llama-131k-mntss/latents",
-         scan="transcoder-llama-131k-adam-kl",
+         scan="transcoder-llama-131k-mntss",
          remove_prefix=1,
          num_layers=16,
          hook_resid_mid=True),
@@ -162,6 +162,9 @@ def upload_to_neuronpedia(circuit_file, model_name, neuronpedia_api_key):
         for source_id, features in features_by_source.items():
             source = sources[source_id]
             print("Source", source_id, "has", len(features), "features")
+            if len(features) > 128:
+                logger.warning(f"Source {source_id} has {len(features)} features, which is more than the maximum of 128. Uploading only the first 128.")
+                features = features[:128]
             try:
                 source.upload_batch(
                     features=features,
@@ -171,6 +174,10 @@ def upload_to_neuronpedia(circuit_file, model_name, neuronpedia_api_key):
 
         circuit_file = Path(circuit_file)
         circuit_text = circuit_file.read_text()
+        circuit_json = json.loads(circuit_text)
+        circuit_json["metadata"]["scan"] = model_id
+        circuit_json["metadata"]["feature_details"] = dict(neuronpedia_source_set=model_cfg["scan"])
+        circuit_text = json.dumps(circuit_json)
         graph_metadata = NPGraphMetadata.upload(circuit_text)
         result_url = graph_metadata.url
         return f"Uploaded to Neuronpedia: {result_url}"

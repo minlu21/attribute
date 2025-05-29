@@ -1,6 +1,6 @@
 # attribute
 
-Reproduction of Anthropic's [Attribution Graphs](https://transformer-circuits.pub/2025/attribution-graphs/methods.html), heavily inspired by https://github.com/jacobdunefsky/transcoder_circuits.
+Reproduction of Anthropic's [Attribution Graphs](https://transformer-circuits.pub/2025/attribution-graphs/methods.html).
 
 ## Setup
 ```
