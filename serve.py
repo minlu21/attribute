@@ -34,6 +34,14 @@ MODEL_OPTIONS = [
          remove_prefix=1,
          num_layers=16,
          hook_resid_mid=True),
+    dict(model_name="meta-llama/Llama-3.2-1B",
+         model_id="llama3.2-1b",
+         transcoder_path="/mnt/ssd-1/nev/",
+         cache_path="results/transcoder-llama-131k-mntss/latents",
+         scan="transcoder-llama-131k-",
+         remove_prefix=1,
+         num_layers=16,
+         hook_resid_mid=True),
     dict(model_name="HuggingfaceTB/SmolLM2-135M",
          model_id="smollm2-135m",
          transcoder_path="nev/SmolLM2-CLT-135M-73k-k32",
@@ -75,11 +83,15 @@ def initialize(request: gr.Request):
     logger.add(log_file.name, level="INFO", filter=lambda record: record["extra"].get("session_hash") == session_hash)
     return {"something_is_running": False, "log_file": log_file, "session_hash": session_hash}
 
+
+def model_from_name(model_name):
+    return [x for x in MODEL_OPTIONS if x["slug"] == model_name][0]
+
 def generate(session, run_name, model_name, prompt):
     with logger.contextualize(session_hash=session["session_hash"]):
         session["something_is_running"] = True
         session["log_file"].truncate(0)
-        model_cfg = [x for x in MODEL_OPTIONS if x["model_name"] == model_name][0]
+        model_cfg = model_from_name(model_name)
         if model_name not in model_cache:
             model_cache[model_name] = TranscodedModel(
                 model_cfg["model_name"],
@@ -110,7 +122,7 @@ def generate(session, run_name, model_name, prompt):
 
 def upload_to_neuronpedia(circuit_file, model_name, neuronpedia_api_key):
     with neuronpedia.api_key(neuronpedia_api_key):
-        model_cfg = [x for x in MODEL_OPTIONS if x["model_name"] == model_name][0]
+        model_cfg = model_from_name(model_name)
         model_id = model_cfg["model_id"]
         try:
             NPModel.new(
@@ -202,8 +214,8 @@ def main():
         gr.Markdown("Input text and get an attribution graph")
 
         run_name = gr.Textbox(label="Run name", value=DEFAULT_RUN_NAME)
-        model_dropdown = gr.Dropdown(label="Model", choices=[x["model_name"] for x in MODEL_OPTIONS],
-                                     value=MODEL_OPTIONS[0]["model_name"],
+        model_dropdown = gr.Dropdown(label="Model", choices=[x["slug"] for x in MODEL_OPTIONS],
+                                     value=MODEL_OPTIONS[0]["slug"],
                                      interactive=True)
         prompt = gr.Textbox(label="Prompt", value="What sport does Michael Jordan play? Michael Jordan plays the sport of")
 

@@ -14,10 +14,11 @@ from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
 from transformers.models.gpt2 import GPT2PreTrainedModel
 from transformers.models.qwen2 import Qwen2PreTrainedModel
+from transformers.models.gemma2 import Gemma2PreTrainedModel
 from loguru import logger
 
 
-LlamaLike = LlamaPreTrainedModel | Qwen2PreTrainedModel
+LlamaLike = LlamaPreTrainedModel | Qwen2PreTrainedModel | Gemma2PreTrainedModel
 GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 
 
@@ -73,6 +74,7 @@ class TranscodedModel(object):
         hookpoint_fn=None,
         device="cuda",
         pre_ln_hook: bool = False,
+        post_ln_hook: bool = False,
         offload: bool = False,
     ):
         logger.info(f"Loading model {model_name} on device {device}")
@@ -100,6 +102,14 @@ class TranscodedModel(object):
                     logger.warning(f"Unknown model type: {type(model)}. Using default hookpoint.")
                     return hookpoint
         self.hookpoints_mlp = [f"{self.layer_prefix}.{i}.mlp" for i in range(self.num_layers)]
+        if post_ln_hook and isinstance(model, Gemma2PreTrainedModel):
+            self.hookpoints_mlp_post = [
+                f"{self.layer_prefix}.{i}.{suffix}"
+                for i in range(self.num_layers)
+                for suffix in ["post_feedforward_layernorm", "post_attention_layernorm"]
+            ]
+        else:
+            self.hookpoints_mlp_post = self.hookpoints_mlp
         self.temp_hookpoints_mlp = [
             hookpoint_fn(hookpoint) for hookpoint in self.hookpoints_mlp
         ]
@@ -132,12 +142,15 @@ class TranscodedModel(object):
         self.hookpoints_layer = [f"{self.layer_prefix}.{i}" for i in range(self.num_layers)]
         self.hookpoints_ln = [f"{self.layer_prefix}.{i}.{self.mlp_layernorm_name}" for i in range(self.num_layers)]
         self.hookpoints_attn_ln = [f"{self.layer_prefix}.{i}.{self.attn_layernorm_name}" for i in range(self.num_layers)]
+        self.additional_ln = []
+        if isinstance(model, Gemma2PreTrainedModel):
+            self.additional_ln += [f"{self.layer_prefix}.{i}.post_feedforward_layernorm" for i in range(self.num_layers)]
         self.name_to_module = {
-            name: model.get_submodule(name) for name in self.hookpoints_layer + self.hookpoints_mlp + self.hookpoints_ln + self.hookpoints_attn_ln
+            name: model.get_submodule(name) for name in self.hookpoints_layer + self.hookpoints_mlp + self.hookpoints_ln + self.hookpoints_attn_ln + self.additional_ln
         }
         self.name_to_index = {
             k: i
-            for arr in [self.hookpoints_layer, self.hookpoints_mlp, self.hookpoints_ln]
+            for arr in [self.hookpoints_layer, self.hookpoints_mlp, self.hookpoints_ln, self.hookpoints_mlp_post]
             for i, k in enumerate(arr)
         }
         self.module_to_name = {v: k for k, v in self.name_to_module.items()}
@@ -178,7 +191,9 @@ class TranscodedModel(object):
         def ln_record_hook(module, input, output, save_dict=None):
             mean = input[0].mean(dim=-1, keepdim=True).detach()
             var = input[0].var(dim=-1, keepdim=True)
-            multiplier = (1 / torch.sqrt(var + getattr(module, "eps", 1e-5)).detach()) * module.weight
+            scale = torch.sqrt(var + getattr(module, "eps", 1e-5))
+            scale = scale.detach()
+            multiplier = (1 / scale) * module.weight
             if save_dict is not None:
                 save_dict[self.module_to_name[module]] = multiplier
             return (input[0] - mean) * multiplier + getattr(module, "bias", 0)
@@ -187,6 +202,9 @@ class TranscodedModel(object):
             ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
             ln.register_forward_hook(ln_record_hook)
             self.freeze_attention_pattern(hookpoint)
+
+        for hookpoint in self.additional_ln:
+            self.name_to_module[hookpoint].register_forward_hook(ln_record_hook)
 
         second_ln = {}
         for hookpoint in self.hookpoints_ln:
@@ -212,8 +230,10 @@ class TranscodedModel(object):
             if isinstance(input, tuple):
                 input = input[0]
 
+            # change module name in case we're reading from the post ff ln instead of the mlp
             module_name = self.module_to_name[module]
             layer_idx = self.name_to_index[module_name]
+            module_name = self.hookpoints_mlp[layer_idx]
             if self.pre_ln_hook:
                 input = resid_mid[layer_idx]
 
@@ -314,6 +334,34 @@ class TranscodedModel(object):
                 error = diff
             else:
                 error = errors_from.mlp_outputs[layer_idx].error
+
+            with torch.no_grad():
+                from matplotlib import pyplot as plt
+                import numpy as np
+                out_recorded = torch.load(f"../circuit-replicate/reconstruction_{layer_idx}.pt")
+                xs = out_recorded[:1, 1:].flatten().cpu().float().numpy()
+                ys = transcoder_out[:1, 1:].flatten().cpu().float().numpy()
+                ymin, ymax = np.min(ys), np.max(ys)
+                plt.scatter(xs, ys, s=1)
+                plt.xlabel("Recorded")
+                plt.ylabel("Ours")
+                plt.ylim(ymin, ymax)
+                plt.xlim(ymin, ymax)
+                plt.savefig(f"results/output_vs_recorded_{layer_idx}.png")
+                plt.close()
+
+
+                err_recorded = torch.load(f"../circuit-replicate/error_{layer_idx}.pt")
+                xs = err_recorded[:1, 1:].flatten().cpu().float().numpy()
+                ys = error[:1, 1:].flatten().cpu().float().numpy()
+                ymin, ymax = np.min(ys), np.max(ys)
+                plt.scatter(xs, ys, s=1)
+                plt.xlabel("Recorded")
+                plt.ylabel("Ours")
+                plt.ylim(ymin, ymax)
+                plt.xlim(ymin, ymax)
+                plt.savefig(f"results/error_vs_recorded_{layer_idx}.png")
+                plt.close()
             error = error.clone()
             error.detach_()
             error.requires_grad_(True)
@@ -329,7 +377,7 @@ class TranscodedModel(object):
             errors[module_name] = error
             return result
 
-        for hookpoint in self.hookpoints_mlp:
+        for hookpoint in self.hookpoints_mlp_post:
             self.name_to_module[hookpoint].register_forward_hook(get_mlp_hook)
 
         outputs = self.model(input_ids=tokenized_prompt.input_ids,
@@ -396,7 +444,9 @@ class TranscodedModel(object):
 
     @property
     def mlp_layernorm_name(self):
-        if isinstance(self.model, LlamaLike):
+        if isinstance(self.model, Gemma2PreTrainedModel):
+            return "post_feedforward_layernorm"
+        elif isinstance(self.model, LlamaLike):
             return "post_attention_layernorm"
         elif isinstance(self.model, GPT2Like):
             return "ln_2"

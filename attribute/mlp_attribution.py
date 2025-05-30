@@ -237,7 +237,8 @@ class AttributionGraph:
                 return logit_weights @ B.to(logit_weights.device)
 
             # Calculate node influence and apply threshold
-            node_influence = compute_influence(normalize_matrix(edge_matrix["edge_matrix"]))
+            # node_influence = compute_influence(normalize_matrix(edge_matrix["edge_matrix"]))
+            act_mat_vals = edge_matrix["activation_matrix_values"].cpu().tolist()
 
             xs = []
             ys = []
@@ -251,8 +252,10 @@ class AttributionGraph:
                     dedup_node_indices[node_id]
                 except KeyError:
                     continue
-                xs.append(node_influence[i].item())
-                ys.append(usage[dedup_node_indices[node_id]])
+                # xs.append(node_influence[i].item())
+                xs.append(act_mat_vals[i])
+                # ys.append(usage[dedup_node_indices[node_id]])
+                ys.append(activation_sources[dedup_node_indices[node_id]])
             from matplotlib import pyplot as plt
             plt.scatter(xs, ys)
             plt.plot([0, 0.05], [0, 0.05], color="black")
@@ -335,18 +338,39 @@ class AttributionGraph:
             # edge_scores = pruned_matrix["edge_scores"].cpu()
             xs = []
             ys = []
-            for i, (layer_idx_0, seq_idx_0, feature_idx_0) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
-                for j, (layer_idx_1, seq_idx_1, feature_idx_1) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
-                    seq_idx = seq_idx - 1
+            colors = []
+            def node_from_index(index: int):
+                try:
+                    layer_idx_0, seq_idx_0, feature_idx_0 = edge_matrix["activation_matrix_indices"][index].tolist()
+                except IndexError:
+                    err_index = index - edge_matrix["activation_matrix_indices"].shape[0]
+                    num_positions = self.cache.original_input_ids.shape[-1]
+                    layer_idx_0 = err_index // num_positions
+                    seq_idx_0 = err_index % num_positions
+                    if layer_idx_0 >= self.model.num_layers:
+                        return None
+                    return f"error_{seq_idx_0 - 1}_{layer_idx_0}"
+                seq_idx_0 = seq_idx_0 - 1
+                if (seq_idx_0, layer_idx_0, feature_idx_0) not in self.intermediate_nodes:
+                    return None
+                return self.intermediate_nodes[(seq_idx_0, layer_idx_0, feature_idx_0)].id
+            from tqdm import trange
+            for i in trange(edge_scores.shape[0]):
+                for j in range(edge_scores.shape[1]):
                     score = float(edge_scores[i, j])
                     if score == 0:
                         continue
-                    if (seq_idx_0, layer_idx_0, feature_idx_0) not in self.intermediate_nodes:
+                    source_id = node_from_index(i)
+                    target_id = node_from_index(j)
+                    if source_id is None or target_id is None:
                         continue
-                    if (seq_idx_1, layer_idx_1, feature_idx_1) not in self.intermediate_nodes:
+                    source_node = self.nodes[source_id]
+                    target_node = self.nodes[target_id]
+
+                    if source_node.layer_index - target_node.layer_index > 1:
                         continue
-                    source_id = self.intermediate_nodes[(seq_idx_0, layer_idx_0, feature_idx_0)].id
-                    target_id = self.intermediate_nodes[(seq_idx_1, layer_idx_1, feature_idx_1)].id
+                    if source_node.token_position != target_node.token_position:
+                        continue
                     source_idx = filtered_index[dedup_node_indices[source_id]]
                     target_idx = filtered_index[dedup_node_indices[target_id]]
                     if source_idx < 0 or target_idx < 0:
@@ -355,13 +379,23 @@ class AttributionGraph:
                     # ys.append(filtered_influence[source_idx, target_idx])
                     # ys.append(filtered_adj_matrix[source_idx, target_idx])
                     # ys.append(orig_filtered_adj_matrix[source_idx, target_idx])
-                    ys.append(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]])
+                    ys.append(np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]]) * activation_sources[dedup_node_indices[target_id]])
                     # print()
                     # print(i, j, score)
                     # print(source_idx, target_idx)
                     # print(filtered_influence[source_idx, target_idx])
+                    if isinstance(source_node, IntermediateNode) and isinstance(target_node, IntermediateNode):
+                        colors.append("green")
+                    elif isinstance(target_node, ErrorNode):
+                        colors.append("red")
+                    elif isinstance(target_node, InputNode):
+                        colors.append("blue")
+                    elif isinstance(target_node, IntermediateNode):
+                        colors.append("yellow")
+                    else:
+                        colors.append("black")
             from matplotlib import pyplot as plt
-            plt.scatter(xs, ys, s=1)
+            plt.scatter(xs, ys, s=1, c=colors)
             plt.plot([1e-5, 1], [1e-5, 1], color="black")
             plt.xscale("log")
             plt.yscale("log")
@@ -553,7 +587,10 @@ class AttributionGraph:
                 feature_dir.mkdir(parents=True, exist_ok=True)
                 feature_path = feature_dir / f"{cantor(layer, feature)}.json"
                 if feature_path.exists():
-                    feature_vis = json.loads(feature_path.read_text()) | feature_vis
+                    try:
+                        feature_vis = json.loads(feature_path.read_text()) | feature_vis
+                    except json.JSONDecodeError:
+                        pass
                 feature_path.write_text(json.dumps(feature_vis))
 
     def cache_self_explanations(self, cache_path: os.PathLike, save_dir: os.PathLike):
@@ -929,7 +966,6 @@ class AttributionGraph:
                     mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
                     edge = (mlp_grad * (mlp_grad.abs() > self.config.pre_filter_threshold)).abs() * influence * self.cache.mlp_outputs[layer_idx].activation[0]
                     self.queue.layers[layer_idx].contributions += edge
-                    mlp_grad = gradients[mlp_index][batch_idx, -true_seq_len:]
                     n_elem = min(self.config.top_k_edges, (edge > 0).sum().item())
                     if n_elem == 0:
                         continue
