@@ -248,12 +248,19 @@ class TranscodedModel(object):
             with torch.set_grad_enabled(not self.offload):
                 transcoder_acts = runner.encode(input, transcoder)
             if self.offload:
+                pad_to = 256
+
                 with torch.no_grad():
                     unique_ids = torch.unique(transcoder_acts.latent_indices.view(-1))
                     self.offloaded_encoder_indices[layer_idx] = unique_ids.tolist()
                     remapped_indices = (transcoder_acts.latent_indices[..., None] == unique_ids).int().argmax(dim=-1)
-                    transcoder.encoder.weight.data = transcoder.encoder.weight.data[unique_ids].clone()
-                    transcoder.encoder.bias.data = transcoder.encoder.bias.data[unique_ids].clone()
+                    pad_amount = (pad_to - unique_ids.shape[0] % pad_to) % pad_to
+                    unique_ids_padded = torch.nn.functional.pad(unique_ids, (0, pad_amount))
+                    transcoder.encoder.weight.data = transcoder.encoder.weight.data[unique_ids_padded].clone()
+                    new_bias = transcoder.encoder.bias.data[unique_ids_padded].clone()
+                    inf_mask = torch.nn.functional.pad(torch.ones_like(unique_ids, dtype=torch.bool), (0, pad_amount))
+                    new_bias = torch.where(inf_mask, new_bias, new_bias.min() - 1)
+                    transcoder.encoder.bias.data = new_bias
                     gc.collect()
                     torch.cuda.empty_cache()
                 second_acts = runner.encode(input, transcoder)
@@ -313,7 +320,9 @@ class TranscodedModel(object):
                 with torch.no_grad():
                     unique_decoder_indices = torch.unique(outputs.latent_indices.view(-1))
                     self.offloaded_decoder_indices[layer_idx] = unique_decoder_indices.tolist()
-                    transcoder.W_dec.data = transcoder.W_dec.data[unique_decoder_indices]
+                    pad_amount = (pad_to - unique_decoder_indices.shape[0] % pad_to) % pad_to
+                    unique_decoder_indices_padded = torch.nn.functional.pad(unique_decoder_indices, (0, pad_amount))
+                    transcoder.W_dec.data = transcoder.W_dec.data[unique_decoder_indices_padded]
                     original_fn = transcoder.decode
                     def decode_remapped(top_acts, top_indices, *args, **kwargs):
                         remapped_indices = (top_indices[..., None] == unique_decoder_indices).int().argmax(dim=-1)

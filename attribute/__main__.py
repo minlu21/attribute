@@ -18,6 +18,7 @@ async def main(
     scan = "default",
     remove_prefix = 0,
     pre_ln_hook = False,
+    offload: bool = False,
     **kwargs,
 ):
     logger.remove()
@@ -33,6 +34,7 @@ async def main(
         transcoder_path=transcoder_path,
         device="cuda",
         pre_ln_hook=pre_ln_hook,
+        offload=offload,
     )
     transcoded_outputs = model([prompt] * config.batch_size)
     transcoded_outputs.remove_prefix(remove_prefix)
