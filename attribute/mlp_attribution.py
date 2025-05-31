@@ -330,7 +330,7 @@ class AttributionGraph:
             plt.savefig("results/edge_cumsum.png")
             plt.close()
 
-        if DEBUG:
+        if DEBUG and False:
             edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
             pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
             # edge_scores = pruned_matrix["normalized_pruned"].cpu()
@@ -935,6 +935,10 @@ class AttributionGraph:
             retain_graph=True,
         )
 
+        if DEBUG:
+            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
+            mlp_indices = edge_matrix["activation_matrix_indices"].tolist()
+
         with measure_time("Summarizing contributions of node", disabled=True), torch.no_grad():
             for batch_idx, (target_node, influence) in enumerate(zip(target_nodes, influences)):
                 all_contributions = []
@@ -950,6 +954,47 @@ class AttributionGraph:
                 for layer_idx in range(max_mlp_layer):
                     error_index = 2 + layer_idx * 2
                     error_grad, error_val = gradients[error_index], backward_to[error_index]
+
+                    if DEBUG and isinstance(target_node, IntermediateNode) and target_node.layer_index - layer_idx == 1:
+                        error_grad_ = error_grad[batch_idx, -true_seq_len:]
+                        try:
+                            target_index = mlp_indices.index([target_node.layer_index, target_node.token_position + 1, target_node.feature_index])
+                        except ValueError:
+                            continue
+                        cache_path = Path("../circuit-replicate/grads")
+                        from natsort import natsorted
+                        for pt_file in natsorted(cache_path.glob("*.pt")):
+                            # grads_blocks.0.mlp.hook_out_3691_3698.pt
+                            import re
+                            try:
+                                source_layer_, start_target, end_target = re.match(r"grads_blocks\.([0-9]+)\.mlp\.hook_out_([0-9]+)_([0-9]+)\.pt", pt_file.name).groups()
+                            except AttributeError:
+                                continue
+
+                            source_layer_ = int(source_layer_)
+                            start_target = int(start_target)
+                            end_target = int(end_target)
+                            if layer_idx != source_layer_:
+                                print("wrong layer", layer_idx, source_layer_)
+                                continue
+                            if target_index < start_target or target_index >= end_target:
+                                print("wrong index", target_index, start_target, end_target)
+                                continue
+                            break
+                        else:
+                            print(f"No gradient found for {target_node.layer_index}, {target_node.token_position}, {target_node.feature_index}")
+                            continue
+                        pt_file = torch.load(pt_file, weights_only=False)
+                        index_of_target = target_index - start_target
+                        gradients = pt_file["grads"][index_of_target][1:]
+
+                        xs = error_grad_.detach().cpu().flatten().float().numpy()
+                        ys = gradients.detach().cpu().flatten().float().numpy()
+                        from matplotlib import pyplot as plt
+                        plt.scatter(xs, ys)
+                        os.makedirs("results/grads", exist_ok=True)
+                        plt.savefig(f"results/grads/{target_node.layer_index}_{target_node.token_position}_{target_node.feature_index}.png")
+                        plt.close()
 
                     for seq_idx in range(target_node.token_position + 1):
                         error_contribution = error_grad[batch_idx, -true_seq_len:][seq_idx] @ error_val[batch_idx, -true_seq_len:][seq_idx]
