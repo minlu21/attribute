@@ -52,6 +52,6 @@ eai-sparsify = { git = "https://github.com/EleutherAI/clt-training", branch="clt
 
 
 [tool.ruff]
-exclude = ["feature_vis.py", "accuracy.py", "autopatch.py", "self_explanation.py"]
+exclude = ["experiments/*.py"]
 # Ignore F722 for jaxtyping
 ignore = ["F722"]

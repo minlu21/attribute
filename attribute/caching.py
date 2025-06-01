@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import torch
 from jaxtyping import Array, Float, Int
 from sparsify import SparseCoder, CrossLayerRunner
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, PreTrainedModel, AutoTokenizer
 from transformers.models.llama import LlamaPreTrainedModel
 from transformers.models.gpt_neo import GPTNeoPreTrainedModel
 from transformers.models.gpt2 import GPT2PreTrainedModel
@@ -20,6 +20,8 @@ from loguru import logger
 
 LlamaLike = LlamaPreTrainedModel | Qwen2PreTrainedModel | Gemma2PreTrainedModel
 GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
+
+DEBUG = os.environ.get("ATTRIBUTE_DEBUG", "0") == "1"
 
 
 @dataclass
@@ -69,7 +71,7 @@ class TranscodedModel(object):
     @torch.no_grad()
     def __init__(
         self,
-        model_name: str | os.PathLike,
+        model_name: str | os.PathLike | PreTrainedModel,
         transcoder_path: os.PathLike,
         hookpoint_fn=None,
         device="cuda",
@@ -79,11 +81,15 @@ class TranscodedModel(object):
     ):
         logger.info(f"Loading model {model_name} on device {device}")
         self.device = device
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": device},
-            torch_dtype=torch.bfloat16,
-        )
+        if isinstance(model_name, PreTrainedModel):
+            model = model_name
+            model_name = model.name_or_path
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map={"": device},
+                torch_dtype=torch.bfloat16,
+            )
         model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = model
@@ -237,6 +243,21 @@ class TranscodedModel(object):
             if self.pre_ln_hook:
                 input = resid_mid[layer_idx]
 
+            if DEBUG:
+                # mlp_in_path = f"../circuit-replicate/mlp_in_{layer_idx}.pt"
+                mlp_in_path = f"experiments/results/mlp_in_{layer_idx}.pt"
+                input_recorded = torch.load(mlp_in_path)
+                from matplotlib import pyplot as plt
+                import numpy as np
+                xs = input[:1, 1:].detach().flatten().cpu().float().numpy()
+                ys = input_recorded[:1, 1:].detach().flatten().cpu().float().numpy()
+                plt.scatter(xs, ys)
+                plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1] ** 2}")
+                plt.savefig(f"results/mlp_in_{layer_idx}.png")
+                plt.close()
+
+                # input = (input - input.detach()) + input_recorded
+
             if self.offload:
                 if module_name in self.transcoders:
                     del self.transcoders[module_name]
@@ -337,6 +358,12 @@ class TranscodedModel(object):
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
 
+            # if DEBUG:
+                # error_path = f"../circuit-replicate/error_{layer_idx}.pt"
+                # error_recorded = torch.load(error_path)
+                # diff[:, 1:] = ((diff - diff.detach()) + error_recorded)[:, 1:]
+                # diff = ((diff - diff.detach()) + error_recorded)
+
             if no_error:
                 error = torch.zeros_like(output)
             elif errors_from is None:
@@ -344,33 +371,35 @@ class TranscodedModel(object):
             else:
                 error = errors_from.mlp_outputs[layer_idx].error
 
-            with torch.no_grad():
-                from matplotlib import pyplot as plt
-                import numpy as np
-                out_recorded = torch.load(f"../circuit-replicate/reconstruction_{layer_idx}.pt")
-                xs = out_recorded[:1, 1:].flatten().cpu().float().numpy()
-                ys = transcoder_out[:1, 1:].flatten().cpu().float().numpy()
-                ymin, ymax = np.min(ys), np.max(ys)
-                plt.scatter(xs, ys, s=1)
-                plt.xlabel("Recorded")
-                plt.ylabel("Ours")
-                plt.ylim(ymin, ymax)
-                plt.xlim(ymin, ymax)
-                plt.savefig(f"results/output_vs_recorded_{layer_idx}.png")
-                plt.close()
+            if DEBUG:
+                with torch.no_grad():
+                    from matplotlib import pyplot as plt
+                    import numpy as np
+                    out_recorded = torch.load(f"../circuit-replicate/reconstruction_{layer_idx}.pt")
+                    xs = out_recorded[:1, 1:].flatten().cpu().float().numpy()
+                    ys = transcoder_out[:1, 1:].flatten().cpu().float().numpy()
+                    ymin, ymax = np.min(ys), np.max(ys)
+                    plt.scatter(xs, ys, s=1)
+                    plt.xlabel("Recorded")
+                    plt.ylabel("Ours")
+                    plt.ylim(ymin, ymax)
+                    plt.xlim(ymin, ymax)
+                    plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1] ** 2}")
+                    plt.savefig(f"results/output_vs_recorded_{layer_idx}.png")
+                    plt.close()
 
 
-                err_recorded = torch.load(f"../circuit-replicate/error_{layer_idx}.pt")
-                xs = err_recorded[:1, 1:].flatten().cpu().float().numpy()
-                ys = error[:1, 1:].flatten().cpu().float().numpy()
-                ymin, ymax = np.min(ys), np.max(ys)
-                plt.scatter(xs, ys, s=1)
-                plt.xlabel("Recorded")
-                plt.ylabel("Ours")
-                plt.ylim(ymin, ymax)
-                plt.xlim(ymin, ymax)
-                plt.savefig(f"results/error_vs_recorded_{layer_idx}.png")
-                plt.close()
+                    err_recorded = torch.load(f"../circuit-replicate/error_{layer_idx}.pt")
+                    xs = err_recorded[:1, 1:].flatten().cpu().float().numpy()
+                    ys = error[:1, 1:].flatten().cpu().float().numpy()
+                    ymin, ymax = np.min(ys), np.max(ys)
+                    plt.scatter(xs, ys, s=1)
+                    plt.xlabel("Recorded")
+                    plt.ylabel("Ours")
+                    plt.ylim(ymin, ymax)
+                    plt.xlim(ymin, ymax)
+                    plt.savefig(f"results/error_vs_recorded_{layer_idx}.png")
+                    plt.close()
             error = error.clone()
             error.detach_()
             error.requires_grad_(True)
@@ -383,6 +412,8 @@ class TranscodedModel(object):
             transcoder_locations[module_name] = latent_indices
 
             result = (transcoder_out + error).to(output)
+            # if errors_from is None and not no_error:
+                # result = output.detach() + (result - result.detach())
             errors[module_name] = error
             return result
 
@@ -684,7 +715,7 @@ class TranscodedModel(object):
             indices = torch.arange(output.shape[-1], device=output.device)
             mask = (indices >= start) & (indices < end)
             output = torch.where(mask, output.detach(), output)
-            return output
+            return output.detach()
         for module, start, end in (self.attn_q_slice(index), self.attn_k_slice(index)):
             module.register_forward_hook(partial(freeze_slice,
                                                  start=torch.tensor(start, device=self.device),
