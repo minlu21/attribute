@@ -207,7 +207,7 @@ class AttributionGraph:
             print(f"{n_unused / edge_scores.shape[0]:.3f}")
             indices_adj = np.array(indices_adj)
             indices_edge = np.array(indices_edge)
-            adj_matrix *= 0
+            # adj_matrix *= 0
             # adj_matrix[indices_adj[:, None], indices_adj[None, :]] = edge_scores[indices_edge[:, None], indices_edge[None, :]]
             # adj_matrix[indices_adj][:, indices_adj] = edge_scores[indices_edge][:, indices_edge]
             adj_mgrid = np.meshgrid(indices_adj, indices_adj)
@@ -218,7 +218,7 @@ class AttributionGraph:
                     print("ZERO ROW:", i, np.abs(adj_matrix[i]).sum())
                     print(dedup_node_names[i], i in indices_adj, edge_scores[indices_edge[indices_adj == i], :].sum())
                     print(self.nodes[dedup_node_names[i]])
-            exit()
+            # exit()
 
         if normalize:
             adj_matrix /= np.maximum(1e-2, np.nan_to_num(adj_matrix.sum(axis=1, keepdims=True)))
@@ -325,41 +325,48 @@ class AttributionGraph:
             # Calculate node influence and apply threshold
             # node_influence = compute_influence(normalize_matrix(edge_matrix["edge_matrix"]))
             pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
-            # node_influence = pruned_matrix["node_influence"].cpu().tolist()
-            act_mat_vals = edge_matrix["activation_matrix_values"].cpu().tolist()
-            unnormalized = edge_matrix["edge_matrix"].abs().cpu().numpy()
-            node_sums = unnormalized.sum(axis=1)
-            inf_sums = np.abs(original_adj_matrix).sum(axis=1)
+            node_influence = pruned_matrix["node_influence"].cpu().tolist()
+            # act_mat_vals = edge_matrix["activation_matrix_values"].cpu().tolist()
+            # unnormalized = edge_matrix["edge_matrix"].abs().cpu().numpy()
+            # node_sums = unnormalized.sum(axis=1)
+            # inf_sums = np.abs(original_adj_matrix).sum(axis=1)
 
             xs = []
             ys = []
-            for i, (layer_idx, seq_idx, feature_idx) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
-                seq_idx = seq_idx - 1
-                try:
-                    node_id = self.intermediate_nodes[(seq_idx, layer_idx, feature_idx)].id
-                except KeyError:
-                    print("(usage) MISSING NODE:", (seq_idx, layer_idx, feature_idx), act_mat_vals[i])
+            # for i, (layer_idx, seq_idx, feature_idx) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
+            #     seq_idx = seq_idx - 1
+            #     try:
+            #         node_id = self.intermediate_nodes[(seq_idx, layer_idx, feature_idx)].id
+            #     except KeyError:
+            #         print("(usage) MISSING NODE:", (seq_idx, layer_idx, feature_idx), act_mat_vals[i])
+            #         continue
+            #     try:
+            #         dedup_node_indices[node_id]
+            #     except KeyError:
+            #         print("(usage) NOT INCLUDED:", node_id, self.nodes[node_id].activation)
+            #         continue
+            counted = set(dedup_node_indices.keys())
+            for i in range(len(node_influence)):
+                node_id = node_from_index(i, edge_matrix, self)
+                if node_id is None or node_id not in dedup_node_indices:
                     continue
-                try:
-                    dedup_node_indices[node_id]
-                except KeyError:
-                    print("(usage) NOT INCLUDED:", node_id, self.nodes[node_id].activation)
-                    continue
-                # x, y = node_influence[i], inf_sums[dedup_node_indices[node_id]]
-                x, y = node_sums[i], inf_sums[dedup_node_indices[node_id]]
+                counted.remove(node_id)
+                x, y = node_influence[i], usage[dedup_node_indices[node_id]]
+                # x, y = node_sums[i], inf_sums[dedup_node_indices[node_id]]
                 # xs.append(node_influence[i])
                 xs.append(x)
                 # xs.append(act_mat_vals[i])
                 ys.append(y)
                 # ys.append(usage[dedup_node_indices[node_id]])
                 # ys.append(activation_sources[dedup_node_indices[node_id]])
-                if y <= 0:
-                    print(node_id, layer_idx, seq_idx, feature_idx, x, y, act_mat_vals[i], activation_sources[dedup_node_indices[node_id]], np.abs(original_adj_matrix[:, dedup_node_indices[node_id]]).sum(), dedup_node_indices[node_id] in self.indices_adj)
-                    for j, v in enumerate(unnormalized[i]):
-                        if v > 0:
-                            node_src = node_from_index(j, edge_matrix, self)
-                            if node_src is not None and node_src in dedup_node_indices:
-                                print("", node_src, node_src in dedup_node_indices, v, original_adj_matrix[dedup_node_indices[node_id], dedup_node_indices[node_src]], dedup_node_indices[node_src] in self.indices_adj)
+                # if y <= 0:
+                #     print(node_id, layer_idx, seq_idx, feature_idx, x, y, act_mat_vals[i], activation_sources[dedup_node_indices[node_id]], np.abs(original_adj_matrix[:, dedup_node_indices[node_id]]).sum(), dedup_node_indices[node_id] in self.indices_adj)
+                #     for j, v in enumerate(unnormalized[i]):
+                #         if v > 0:
+                #             node_src = node_from_index(j, edge_matrix, self)
+                #             if node_src is not None and node_src in dedup_node_indices:
+                #                 print("", node_src, node_src in dedup_node_indices, v, original_adj_matrix[dedup_node_indices[node_id], dedup_node_indices[node_src]], dedup_node_indices[node_src] in self.indices_adj)
+            print("Not counted:", counted)
             from matplotlib import pyplot as plt
             # plt.xscale("log")
             # plt.yscale("log")
@@ -376,8 +383,7 @@ class AttributionGraph:
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
                   if self.nodes[node].node_type in ("OutputNode",)
                   + (("InputNode",) if self.config.keep_all_input_nodes else ())
-                  + (("ErrorNode",) if self.config.keep_all_error_nodes else ())
-                  and self.nodes[node].token_position >= 0]
+                  + (("ErrorNode",) if self.config.keep_all_error_nodes else ())]
 
         sorted_usage = np.sort(usage)[::-1]
         cumsum_usage = np.cumsum(sorted_usage)
@@ -410,9 +416,9 @@ class AttributionGraph:
         filtered_mask = np.zeros((len(dedup_node_names),), dtype=bool)
         for node in selected_nodes:
             filtered_mask[dedup_node_indices[node]] = 1
-        for node in dedup_node_names:
-            if node.startswith("error"):
-                filtered_mask[dedup_node_indices[node]] = 1
+        # for node in dedup_node_names:
+        #     if node.startswith("error"):
+        #         filtered_mask[dedup_node_indices[node]] = 1
         filtered_index = np.cumsum(filtered_mask) - 1
 
         filtered_adj_matrix = original_adj_matrix[filtered_mask][:, filtered_mask].copy()
@@ -443,18 +449,28 @@ class AttributionGraph:
             mask = pruned_matrix["node_mask"].tolist()
             total = 0
             matching = 0
+            accounted_for = filtered_mask.copy()
             for i, v in enumerate(mask):
                 if v:
                     total += 1
                     node = node_from_index(i, edge_matrix, self)
                     if node is None:
+                        print("NO NODE:", i)
                         continue
                     if node in selected_nodes:
                         matching += 1
+                        accounted_for[dedup_node_indices[node]] = 0
+                    else:
+                        print("WRONG NODE:", i, node, node in selected_nodes, usage[dedup_node_indices[node]], adj_matrix[:, dedup_node_indices[node]].sum())
+            for i, v in enumerate(accounted_for):
+                if v:
+                    print("not accounted for:", i, dedup_node_names[i], usage[i])
+
             print(f"{matching / total:.3f}", matching, total)
-            edge_scores = edge_matrix["edge_matrix"].abs().cpu()
+
+            # edge_scores = edge_matrix["edge_matrix"].abs().cpu()
             # edge_scores = pruned_matrix["normalized"].cpu()
-            # edge_scores = pruned_matrix["normalized_pruned"].cpu()
+            edge_scores = pruned_matrix["normalized_pruned"].cpu()
             # edge_scores = pruned_matrix["pruned_matrix"].cpu()
             # edge_scores = pruned_matrix["edge_scores"].cpu()
             xs = []
@@ -480,17 +496,21 @@ class AttributionGraph:
                     # if source_node.token_position != target_node.token_position:
                     #     continue
 
-                    # source_idx = filtered_index[dedup_node_indices[source_id]]
-                    # target_idx = filtered_index[dedup_node_indices[target_id]]
+                    source_idx = filtered_index[dedup_node_indices[source_id]]
+                    target_idx = filtered_index[dedup_node_indices[target_id]]
 
-                    # if filtered_mask[dedup_node_indices[source_id]] == 0 or filtered_mask[dedup_node_indices[target_id]] == 0:
-                    #     continue
-                    xs.append(score)
+                    if filtered_mask[dedup_node_indices[source_id]] == 0 or filtered_mask[dedup_node_indices[target_id]] == 0:
+                        continue
+                    x, y = score, filtered_adj_matrix[source_idx, target_idx]
+                    # x, y = np.abs(score), orig_filtered_adj_matrix[source_idx, target_idx]
+                    if abs(x - y) > 1e-1:
+                        print("VERY WRONG:", source_id, target_id, x, y)
+                    xs.append(x)
                     # ys.append(influence[dedup_node_indices[source_id], dedup_node_indices[target_id]])
-                    ys.append(np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]]))
+                    # ys.append(np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]]))
                     # ys.append(adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]])
                     # ys.append(filtered_influence[source_idx, target_idx])
-                    # ys.append(filtered_adj_matrix[source_idx, target_idx])
+                    ys.append(y)
                     # ys.append(orig_filtered_adj_matrix[source_idx, target_idx])
                     # ys.append(np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]]))# * activation_sources[dedup_node_indices[target_id]])
                     # print()
@@ -509,9 +529,10 @@ class AttributionGraph:
                         colors.append("black")
             from matplotlib import pyplot as plt
             plt.scatter(xs, ys, s=1, c=colors)
-            plt.plot([1e-5, 1], [1e-5, 1], color="black")
-            # plt.xscale("log")
-            # plt.yscale("log")
+            y_min, y_max = min(ys), max(ys)
+            plt.plot([y_min, y_max], [y_min, y_max], color="black")
+            plt.xscale("log")
+            plt.yscale("log")
             plt.xlabel("Theirs")
             plt.ylabel("Ours")
             plt.savefig("results/influence_vs_score.png")
@@ -547,9 +568,12 @@ class AttributionGraph:
                     continue
             export_nodes.append(self.nodes[n])
         self.exported_nodes = export_nodes
+        logger.info(f"Final number of nodes: {len(export_nodes)}")
 
         logger.info("Exporting graph")
-        tokens = [self.model.decode_token(i) for i in self.input_ids]
+        export_offset = self.cache.original_input_ids.shape[-1] - self.cache.input_ids.shape[-1]
+        input_ids = self.cache.original_input_ids[0].tolist()
+        tokens = [self.model.decode_token(i) for i in input_ids]
         # prefix = ["<EOT>"]
         prefix = []
         metadata = dict(
@@ -577,7 +601,7 @@ class AttributionGraph:
                 node_id=node.id_js,
                 jsNodeId=node.id_js + "-0",
                 feature=int(node.feature_index) if hasattr(node, "feature_index") else None,
-                ctx_idx=node.token_position + len(prefix),
+                ctx_idx=node.token_position + len(prefix) + export_offset,
                 run_idx=0, reverse_ctx_idx=0,
                 clerp="" if not isinstance(node, OutputNode) else f"output: \"{node.token_str}\" (p={node.probability:.3f})",
                 token_prob=0.0 if not isinstance(node, OutputNode) else node.probability,

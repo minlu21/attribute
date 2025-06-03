@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# PROMPT_NAME="basketball-llama"
+PROMPT_NAME="basketball-llama"
 # PROMPT_NAME="basketball-smollm"
 # PROMPT_NAME="basketball-llama-base"
 # SCAN=transcoder_llama_131k_highbs_v0
