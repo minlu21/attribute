@@ -137,6 +137,8 @@ class TranscodedModel(object):
                     transcoder_path / temp_hookpoint,
                     device=device,
                 )
+            if DEBUG:
+                sae = sae.to(torch.bfloat16)
             sae.requires_grad_(False)
             self.transcoders[hookpoint] = sae
         for hookpoint, temp_hookpoint in zip(self.hookpoints_mlp, self.temp_hookpoints_mlp):
@@ -257,6 +259,7 @@ class TranscodedModel(object):
                 plt.close()
 
                 # input = (input - input.detach()) + input_recorded
+                input[:, 1:] = ((input - input.detach()) + input_recorded)[:, 1:]
 
             if self.offload:
                 if module_name in self.transcoders:
@@ -267,7 +270,34 @@ class TranscodedModel(object):
             batch_dims = input.shape[:-1]
             input = input.view(-1, input.shape[-1])
             with torch.set_grad_enabled(not self.offload):
+                if DEBUG:
+                    trans_acts = torch.load(f"../circuit-replicate/transcoder_acts_{layer_idx}.pt")
+                    transcoder.encoder.weight.data = trans_acts["W_enc"].T#.contiguous()
+                    transcoder.encoder.bias.data = trans_acts["b_enc"]
+                    transcoder.b_dec.data = trans_acts["b_dec"]
+                    transcoder.W_dec.data = trans_acts["W_dec"]
+                    input = input.to(transcoder.encoder.weight.dtype)
+                    input = trans_acts["inputs"][:1, :, :].repeat(batch_dims[0], 1, 1).flatten(0, 1) + (input - input.detach())
+
+                    # pre_acts = torch.nn.functional.linear(input.unflatten(0, batch_dims)[0, 1:], transcoder.encoder.weight, transcoder.encoder.bias).relu()
+
+                    pre_acts = (input.unflatten(0, batch_dims)[0, 1:] @ transcoder.encoder.weight.T + transcoder.encoder.bias).relu()
+                    # pre_acts = (input @ transcoder.encoder.weight.T + transcoder.encoder.bias).relu()
+                    # pre_acts = pre_acts.unflatten(0, batch_dims)[0, 1:]
+
+                    # print(pre_acts - trans_acts["acts"])
+                    # print(torch.abs(pre_acts - trans_acts["acts"][1:]).max(dim=-1).values.tolist())
                 transcoder_acts = runner.encode(input, transcoder)
+                if DEBUG:
+                    # pre_acts = (input @ transcoder.encoder.weight.T + transcoder.encoder.bias).relu()
+                    pre_acts = (input @ trans_acts["W_enc"] + transcoder.encoder.bias)
+                    acts = trans_acts["acts"]
+                    acts = acts.unsqueeze(0).repeat(batch_dims[0], 1, 1).flatten(0, 1)
+                    pre_acts = (pre_acts - pre_acts.detach()) + acts
+                    # print(torch.abs(pre_acts.unflatten(0, batch_dims)[0, 1:] - trans_acts["acts"][1:]).max(dim=-1).values.tolist())
+                    latent_acts, latent_indices = torch.topk(pre_acts, transcoder_acts.latent_acts.shape[-1], dim=-1)
+                    transcoder_acts.latent_acts = latent_acts
+                    transcoder_acts.latent_indices = latent_indices
             if self.offload:
                 pad_to = 256
 
@@ -325,7 +355,7 @@ class TranscodedModel(object):
                 transcoder_acts.latent_acts = acts
                 transcoder_acts.latent_indices = indices
 
-            l0 = (transcoder_acts.latent_acts != 0).float().sum(dim=-1).mean().item()
+            l0 = (transcoder_acts.latent_acts.unflatten(0, batch_dims)[:, 1:] != 0).float().sum(dim=-1).mean().item()
             l0s[module_name] = l0
             target_latent_acts = transcoder_acts.latent_acts.clone().unflatten(0, batch_dims)
             source_latent_acts = transcoder_acts.latent_acts

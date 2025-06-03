@@ -19,6 +19,7 @@ async def main(
     remove_prefix = 0,
     pre_ln_hook = False,
     offload: bool = False,
+    force_k: int = None,
     **kwargs,
 ):
     logger.remove()
@@ -36,6 +37,9 @@ async def main(
         pre_ln_hook=pre_ln_hook,
         offload=offload,
     )
+    if force_k is not None:
+        for transcoder in model.transcoders.values():
+            transcoder.cfg.k = force_k
     transcoded_outputs = model([prompt] * config.batch_size)
     transcoded_outputs.remove_prefix(remove_prefix)
 
