@@ -18,6 +18,7 @@ async def main(
     scan = "default",
     remove_prefix = 0,
     pre_ln_hook = False,
+    post_ln_hook = False,
     offload: bool = False,
     force_k: int = None,
     **kwargs,
@@ -35,6 +36,7 @@ async def main(
         transcoder_path=transcoder_path,
         device="cuda",
         pre_ln_hook=pre_ln_hook,
+        post_ln_hook=post_ln_hook,
         offload=offload,
     )
     if force_k is not None:

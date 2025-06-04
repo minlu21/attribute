@@ -28,11 +28,13 @@ api = HfApi()
 files = api.list_repo_files("google/gemma-scope-2b-pt-transcoders", repo_type="model")
 output_path = Path("../results/gemma-scope-2b-pt-transcoders")
 output_path.mkdir(parents=True, exist_ok=True)
+#%%
+# for layer in []:
 for layer in tqdm(range(26)):
     prefix = f"layer_{layer}/width_16k/"
     filtered = [f for f in files if f.startswith(prefix)]
     filtered_l0 = [int(f.partition("average_l0_")[2].partition("/")[0]) for f in filtered]
-    divergences = [abs(x - 100) for x in filtered_l0]
+    divergences = [abs(x - 48) for x in filtered_l0]
     min_divergence_index = np.argmin(divergences)
     min_divergence_file = filtered[min_divergence_index]
     print(layer, min_divergence_file)
@@ -62,7 +64,7 @@ for layer in tqdm(range(26)):
     d_f = b_enc.shape[0]
 
     pre_mlp_rmsnorm = 1.0 + model.model.layers[layer].pre_feedforward_layernorm.weight
-    post_mlp_rmsnorm = 1.0 + model.model.layers[layer].post_feedforward_layernorm.weight
+    post_mlp_rmsnorm = 1.0  # + model.model.layers[layer].post_feedforward_layernorm.weight
 
     W_enc = W_enc / pre_mlp_rmsnorm
     W_dec = W_dec / post_mlp_rmsnorm
@@ -70,7 +72,7 @@ for layer in tqdm(range(26)):
     coder = SparseCoder(d_in, SparseCoderConfig(
         activation="topk",
         num_latents=d_f,
-        k=128,
+        k=256,
         transcode=True,
         skip_connection=False,
     ), device=device)
@@ -88,6 +90,6 @@ model_hooked = TranscodedModel(
     device=device,
     post_ln_hook=True,
 )
-
-# %%
-model_hooked("In another moment, down went Alice after it, never once considering how in the world she was to get out again.")
+#%%
+model_hooked("In another moment, down went Alice after it, never once considering how in the world she was to get out again.");
+#%%

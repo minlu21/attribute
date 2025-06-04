@@ -93,6 +93,7 @@ class TranscodedModel(object):
         self.offload = offload
 
         if transcoder_path is None:
+            logger.warning("No transcoder path provided. Returning model without hooks.")
             return
         if hookpoint_fn is None:
             def hookpoint_fn(hookpoint):
@@ -106,9 +107,8 @@ class TranscodedModel(object):
         self.hookpoints_mlp = [f"{self.layer_prefix}.{i}.mlp" for i in range(self.num_layers)]
         if post_ln_hook and isinstance(model, Gemma2PreTrainedModel):
             self.hookpoints_mlp_post = [
-                f"{self.layer_prefix}.{i}.{suffix}"
+                f"{self.layer_prefix}.{i}.post_feedforward_layernorm"
                 for i in range(self.num_layers)
-                for suffix in ["post_feedforward_layernorm", "post_attention_layernorm"]
             ]
         else:
             self.hookpoints_mlp_post = self.hookpoints_mlp
@@ -146,7 +146,11 @@ class TranscodedModel(object):
         self.hookpoints_attn_ln = [f"{self.layer_prefix}.{i}.{self.attn_layernorm_name}" for i in range(self.num_layers)]
         self.additional_ln = []
         if isinstance(model, Gemma2PreTrainedModel):
-            self.additional_ln += [f"{self.layer_prefix}.{i}.post_feedforward_layernorm" for i in range(self.num_layers)]
+            self.additional_ln += [
+                f"{self.layer_prefix}.{i}.{suffix}"
+                for i in range(self.num_layers)
+                for suffix in ["post_feedforward_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm"]
+            ]
         self.name_to_module = {
             name: model.get_submodule(name) for name in self.hookpoints_layer + self.hookpoints_mlp + self.hookpoints_ln + self.hookpoints_attn_ln + self.additional_ln
         }
@@ -157,6 +161,7 @@ class TranscodedModel(object):
         }
         self.module_to_name = {v: k for k, v in self.name_to_module.items()}
         self.pre_ln_hook = pre_ln_hook
+        self.post_ln_hook = post_ln_hook
 
     def clear_hooks(self):
         for mod in self.model.modules():
@@ -191,14 +196,18 @@ class TranscodedModel(object):
         self.clear_hooks()
 
         def ln_record_hook(module, input, output):
+            return output
             if "rmsnorm" in type(module).__name__.lower():
                 mean = 0
             else:
                 mean = input[0].mean(dim=-1, keepdim=True).detach()
-            var = input[0].var(dim=-1, keepdim=True)
-            scale = torch.sqrt(var + getattr(module, "eps", 1e-5))
+            var = input[0].pow(2).mean(dim=-1, keepdim=True)
+            scale = torch.rsqrt(var + getattr(module, "eps", 1e-5))
             scale = scale.detach()
-            multiplier = (1 / scale) * module.weight
+            weight = module.weight
+            if isinstance(self.model, Gemma2PreTrainedModel):
+                weight = weight + 1
+            multiplier = scale * weight
             return (input[0] - mean) * multiplier + getattr(module, "bias", 0)
 
         for hookpoint in self.hookpoints_layer:
@@ -223,7 +232,14 @@ class TranscodedModel(object):
                 resid_mid[self.name_to_index[self.module_to_name[module]]] = input
             for hookpoint in self.hookpoints_ln:
                 self.name_to_module[hookpoint].register_forward_hook(record_resid_mid)
-
+        elif self.post_ln_hook:
+            resid_mid = {}
+            def record_resid_mid(module, input, output):
+                if isinstance(input, tuple):
+                    input = input[0]
+                resid_mid[self.name_to_index[self.module_to_name[module]]] = input
+            for hookpoint in self.hookpoints_mlp:
+                self.name_to_module[hookpoint].register_forward_hook(record_resid_mid)
         runner = CrossLayerRunner()
         target_transcoder_activations = {}
         source_transcoder_activations = {}
@@ -239,7 +255,7 @@ class TranscodedModel(object):
             module_name = self.module_to_name[module]
             layer_idx = self.name_to_index[module_name]
             module_name = self.hookpoints_mlp[layer_idx]
-            if self.pre_ln_hook:
+            if self.pre_ln_hook or self.post_ln_hook:
                 input = resid_mid[layer_idx]
             output = output.detach()
 
@@ -434,7 +450,7 @@ class TranscodedModel(object):
     @property
     def mlp_layernorm_name(self):
         if isinstance(self.model, Gemma2PreTrainedModel):
-            return "post_feedforward_layernorm"
+            return "pre_feedforward_layernorm"
         elif isinstance(self.model, LlamaLike):
             return "post_attention_layernorm"
         elif isinstance(self.model, GPT2Like):
