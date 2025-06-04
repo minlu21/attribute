@@ -1,6 +1,8 @@
-window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap} = {}){
+window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap, pruningThreshold} = {}){
   var data = await util.getFile(`/graph_data/${slug}.json`)
+  data = structuredClone(data);
   console.log(data)
+  console.log(data.nodes.length)
 
   var visState = {
     pinnedIds: [],
@@ -19,6 +21,7 @@ window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isG
     sg_pos: '',
     isModal: true,
     isGridsnap,
+    pruningThreshold,
     ...data.qParams
   }
 

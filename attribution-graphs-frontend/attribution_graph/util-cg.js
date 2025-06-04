@@ -165,6 +165,16 @@ window.utilCg = (function(){
     var py_node_id_to_node = {}
     var idToNode = {}
     var maxLayer = d3.max(nodes.filter(d => d.feature_type != 'logit'), d => +d.layer)
+
+    if (visState.pruningThreshold) {
+      nodes = nodes.filter(d =>
+        d.feature_type === 'embedding' ||
+        d.feature_type === 'logit' ||
+        d.influence <= parseFloat(visState.pruningThreshold) ||
+        visState.pinnedIds.includes(d.nodeId)
+      )
+    }
+
     nodes.forEach((d, i) => {
       // To make hover state work across prompts, drop ctx from node id
       d.featureId = `${d.layer}_${d.feature}`

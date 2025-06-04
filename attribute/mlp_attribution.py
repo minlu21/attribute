@@ -221,7 +221,9 @@ class AttributionGraph:
                   + (("InputNode",) if self.config.keep_all_input_nodes else ())
                   + (("ErrorNode",) if self.config.keep_all_error_nodes else ())]
 
-        sorted_usage = np.sort(usage)[::-1]
+        usage_sort = np.argsort(usage)[::-1]
+        usage_rev_sort = np.argsort(usage_sort)
+        sorted_usage = usage[usage_sort]
         cumsum_usage = np.cumsum(sorted_usage)
         cumsum_usage = cumsum_usage / cumsum_usage[-1]
         node_threshold = sorted_usage[np.searchsorted(cumsum_usage, self.config.node_cum_threshold)]
@@ -318,7 +320,8 @@ class AttributionGraph:
             prompt="".join(tokens),
             title_prefix="",
             n_layers=self.model.num_layers,
-            node_threshold=node_threshold,
+            node_sep_threshold=node_threshold,
+            node_threshold=self.config.node_cum_threshold,
         )
 
         nodes_json = [
@@ -340,6 +343,7 @@ class AttributionGraph:
                 clerp="" if not isinstance(node, OutputNode) else f"output: \"{node.token_str}\" (p={node.probability:.3f})",
                 token_prob=0.0 if not isinstance(node, OutputNode) else node.probability,
                 is_target_logit=False,
+                influence=float(cumsum_usage[usage_rev_sort[dedup_node_indices[node.id]]]),
             ) for node in export_nodes
         ]
 
