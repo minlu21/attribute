@@ -43,6 +43,27 @@ if DEBUG:
             print("MISSING NODE:", (seq_idx_0, layer_idx_0, feature_idx_0))
             return None
         return self.intermediate_nodes[(seq_idx_0, layer_idx_0, feature_idx_0)].id
+    # def node_from_index(index: int, edge_matrix: dict, self):
+    #     try:
+    #         layer_idx_0, seq_idx_0, feature_idx_0 = edge_matrix["activation_matrix_indices"][index].tolist()
+    #     except IndexError:
+    #         err_index = index - edge_matrix["activation_matrix_indices"].shape[0]
+    #         num_positions = self.cache.original_input_ids.shape[-1]
+    #         layer_idx_0 = err_index // num_positions
+    #         seq_idx_0 = err_index % num_positions
+    #         if layer_idx_0 >= self.model.num_layers:
+    #             token_index = err_index - (num_positions * self.model.num_layers)
+    #             if token_index < num_positions:
+    #                 return f"input_{token_index - 1}"
+    #             token_index -= num_positions
+    #             token_id = edge_matrix["logit_tokens"][token_index]
+    #             return [node.id for node in self.output_nodes if node.token_idx == token_id][0]
+    #         return f"error_{seq_idx_0 - 1}_{layer_idx_0}"
+    #     seq_idx_0 = seq_idx_0 - 1
+    #     if (seq_idx_0, layer_idx_0, feature_idx_0) not in self.intermediate_nodes:
+    #         print("MISSING NODE:", (seq_idx_0, layer_idx_0, feature_idx_0))
+    #         return None
+    #     return self.intermediate_nodes[(seq_idx_0, layer_idx_0, feature_idx_0)].id
 
 
 @dataclass
@@ -57,7 +78,7 @@ class AttributionConfig:
     # how many target nodes to compute contributions for
     flow_steps: int = 5000
     # batch size for MLP attribution
-    batch_size: int = 8
+    batch_size: int = 32
     # whether to use the softmax gradient for the output node
     # instead of the logit
     softmax_grad_type: Literal["softmax", "mean", "straight"] = "mean"
@@ -164,7 +185,7 @@ class AttributionGraph:
                 weight = abs(weight)
             adj_matrix[target_index, source_index] = weight * activation_sources[source_index]
 
-        if DEBUG:
+        if  DEBUG:
             edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
             # pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
             # edge_scores = pruned_matrix["normalized_pruned"].cpu()
@@ -210,9 +231,9 @@ class AttributionGraph:
             # adj_matrix *= 0
             # adj_matrix[indices_adj[:, None], indices_adj[None, :]] = edge_scores[indices_edge[:, None], indices_edge[None, :]]
             # adj_matrix[indices_adj][:, indices_adj] = edge_scores[indices_edge][:, indices_edge]
-            adj_mgrid = np.meshgrid(indices_adj, indices_adj)
-            edge_mgrid = np.meshgrid(indices_edge, indices_edge)
-            adj_matrix[adj_mgrid[0].flatten(), adj_mgrid[1].flatten()] = edge_scores[edge_mgrid[0].flatten(), edge_mgrid[1].flatten()]
+            # adj_mgrid = np.meshgrid(indices_adj, indices_adj)
+            # edge_mgrid = np.meshgrid(indices_edge, indices_edge)
+            # adj_matrix[adj_mgrid[0].flatten(), adj_mgrid[1].flatten()] = edge_scores[edge_mgrid[0].flatten(), edge_mgrid[1].flatten()]
             for i in range(adj_matrix.shape[0]):
                 if np.abs(adj_matrix[i]).sum() < 1e-5:
                     print("ZERO ROW:", i, np.abs(adj_matrix[i]).sum())
@@ -282,7 +303,7 @@ class AttributionGraph:
             if isinstance(node, OutputNode):
                 influence_sources[index] = node.probability
 
-        if DEBUG:
+        if DEBUG and False:
             edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
             logit_weights = edge_matrix["logit_weights"].tolist()
             # logit_weights = edge_matrix["logit_w"].tolist()
@@ -468,20 +489,25 @@ class AttributionGraph:
 
             print(f"{matching / total:.3f}", matching, total)
 
-            # edge_scores = edge_matrix["edge_matrix"].abs().cpu()
+            edge_scores = edge_matrix["edge_matrix"].abs().cpu()
             # edge_scores = pruned_matrix["normalized"].cpu()
-            edge_scores = pruned_matrix["normalized_pruned"].cpu()
+            # edge_scores = pruned_matrix["normalized_pruned"].cpu()
             # edge_scores = pruned_matrix["pruned_matrix"].cpu()
             # edge_scores = pruned_matrix["edge_scores"].cpu()
             xs = []
             ys = []
             colors = []
+            color_to_diff = defaultdict(list)
             from tqdm import trange
             for i in trange(edge_scores.shape[0]):
                 source_id = node_from_index(i, edge_matrix, self)
                 if source_id is None or source_id not in dedup_node_indices:
                     continue
+                if random.random() < 0.85:
+                    continue
                 for j in range(edge_scores.shape[1]):
+                    if random.random() < 0.85:
+                        continue
                     score = float(edge_scores[i, j])
                     if score == 0:
                         continue
@@ -491,32 +517,9 @@ class AttributionGraph:
                     source_node = self.nodes[source_id]
                     target_node = self.nodes[target_id]
 
-                    # if source_node.layer_index - target_node.layer_index > 1:
-                    #     continue
-                    # if source_node.token_position != target_node.token_position:
-                    #     continue
-
-                    source_idx = filtered_index[dedup_node_indices[source_id]]
-                    target_idx = filtered_index[dedup_node_indices[target_id]]
-
-                    if filtered_mask[dedup_node_indices[source_id]] == 0 or filtered_mask[dedup_node_indices[target_id]] == 0:
-                        continue
-                    x, y = score, filtered_adj_matrix[source_idx, target_idx]
-                    # x, y = np.abs(score), orig_filtered_adj_matrix[source_idx, target_idx]
-                    if abs(x - y) > 1e-1:
-                        print("VERY WRONG:", source_id, target_id, x, y)
+                    x, y = np.abs(score), np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]])
                     xs.append(x)
-                    # ys.append(influence[dedup_node_indices[source_id], dedup_node_indices[target_id]])
-                    # ys.append(np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]]))
-                    # ys.append(adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]])
-                    # ys.append(filtered_influence[source_idx, target_idx])
                     ys.append(y)
-                    # ys.append(orig_filtered_adj_matrix[source_idx, target_idx])
-                    # ys.append(np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]]))# * activation_sources[dedup_node_indices[target_id]])
-                    # print()
-                    # print(i, j, score)
-                    # print(source_idx, target_idx)
-                    # print(filtered_influence[source_idx, target_idx])
                     if isinstance(source_node, IntermediateNode) and isinstance(target_node, IntermediateNode):
                         colors.append("green")
                     elif isinstance(target_node, ErrorNode):
@@ -527,6 +530,7 @@ class AttributionGraph:
                         colors.append("yellow")
                     else:
                         colors.append("black")
+                    color_to_diff[colors[-1]].append(np.abs(np.log(x) - np.log(y)))
             from matplotlib import pyplot as plt
             plt.scatter(xs, ys, s=1, c=colors)
             y_min, y_max = min(ys), max(ys)
@@ -536,6 +540,13 @@ class AttributionGraph:
             plt.xlabel("Theirs")
             plt.ylabel("Ours")
             plt.savefig("results/influence_vs_score.png")
+            plt.close()
+            # bins = np.logspace(-5, 0, 100)
+            bins = np.linspace(0, 5, 100)
+            for color, diffs in color_to_diff.items():
+                plt.hist(diffs, bins=bins, label=color, density=True)
+            plt.legend()
+            plt.savefig("results/influence_vs_score_hist.png")
             plt.close()
             print("AAAAAAA")
         edge_threshold = selected_edge_matrix[np.searchsorted(edge_cumsum, self.config.edge_cum_threshold)]
@@ -1071,9 +1082,10 @@ class AttributionGraph:
             backward_to,
             [gradient],
             retain_graph=True,
+            allow_unused=DEBUG,
         )
 
-        if DEBUG and False:
+        if DEBUG:
             edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
             mlp_indices = edge_matrix["activation_matrix_indices"].tolist()
 
@@ -1091,18 +1103,31 @@ class AttributionGraph:
                     ))
 
                 error_grads = {}
-                # if DEBUG and isinstance(target_node, IntermediateNode) and random.random() < 0.01 and target_node.layer_index > 0:
-                if False:
-                    layer_idx = target_node.layer_index - 1
-                    if 1:
-                        error_index = 2 + layer_idx * 2
-                        error_grad, error_val = gradients[error_index], backward_to[error_index]
-
-                        error_grad_ = error_grad[batch_idx, -true_seq_len:]
+                if False and DEBUG and target_node.layer_index > 0:
+                    target_index = None
+                    if isinstance(target_node, IntermediateNode):
                         try:
                             target_index = mlp_indices.index([target_node.layer_index, target_node.token_position + 1, target_node.feature_index])
                         except ValueError:
+                            pass
+                    elif isinstance(target_node, OutputNode):
+                        token_idx = [i for i, e in enumerate(edge_matrix["logit_tokens"]) if e == target_node.token_idx][0]
+                        # target_index = len(mlp_indices) + self.model.num_layers * self.cache.original_input_ids.shape[1] + token_idx
+                        # batch_size = 64
+                        length_padded = 9000
+                        print("PADDED:", length_padded)
+                        target_index = length_padded + token_idx
+                    else:
+                        pass
+                    # if target_index is not None:
+                        # layer_idx = target_node.layer_index - 1
+                    for layer_idx in (range(target_node.layer_index) if target_index is not None else []):
+                        error_index = 2 + layer_idx * 2
+                        error_grad, error_val = gradients[error_index], backward_to[error_index]
+                        if error_grad is None:
                             continue
+
+                        error_grad_ = error_grad[batch_idx, -true_seq_len:]
                         cache_path = Path("../circuit-replicate/grads")
                         from natsort import natsorted
                         u = True
@@ -1111,12 +1136,17 @@ class AttributionGraph:
                             import re
                             try:
                                 source_layer_, start_target, end_target = re.match(r"grads_blocks\.([0-9]+)\.mlp\.hook_out_([0-9]+)_([0-9]+)\.pt", pt_file.name).groups()
+                                # source_layer_, start_target, end_target = re.match(r"grads_blocks\.([0-9]+)\.hook_resid_mid_([0-9]+)_([0-9]+)\.pt", pt_file.name).groups()
+                                # source_layer_, start_target, end_target = re.match(r"grads_blocks\.([0-9]+)\.hook_resid_pre_([0-9]+)_([0-9]+)\.pt", pt_file.name).groups()
+                                source_layer_ = int(source_layer_)
+                                start_target = int(start_target)
+                                end_target = int(end_target)
+                                # source_layer_ -= 1
+                                if source_layer_ == 0:
+                                    continue
                             except AttributeError:
                                 continue
 
-                            source_layer_ = int(source_layer_)
-                            start_target = int(start_target)
-                            end_target = int(end_target)
                             if layer_idx != source_layer_:
                                 continue
                             if target_index < start_target or target_index >= end_target:
@@ -1124,21 +1154,36 @@ class AttributionGraph:
                             break
                         else:
                             u = False
+                        # if isinstance(target_node, OutputNode):
+                        #     print(target_node, target_index, u, start_target, end_target)
+                        #     exit()
                         if u:
+                            print("match:", target_node.id, target_index, u, start_target, end_target, pt_file)
+
                             pt_file = torch.load(pt_file, weights_only=False)
                             index_of_target = target_index - start_target
+                            assert end_target - start_target <= pt_file["grads"].shape[0]
 
                             gradients_ = pt_file["grads"][index_of_target]
                             error_grads[layer_idx] = gradients_
 
                             xs = error_grad_.detach().cpu().flatten().float().numpy()
                             ys = gradients_[1:].detach().cpu().flatten().float().numpy()
+                            mask = ys != 0
+                            xs = xs[mask]
+                            ys = ys[mask]
+                            min_xy = min(xs.min(), ys.min())
+                            max_xy = max(xs.max(), ys.max())
+                            bound = max(abs(min_xy), abs(max_xy))
                             from matplotlib import pyplot as plt
                             plt.scatter(xs, ys)
+                            plt.xlim(-bound, bound)
+                            plt.ylim(-bound, bound)
                             os.makedirs("results/grads", exist_ok=True)
-                            plt.title(f"Target: {target_node.layer_index}, {target_node.token_position}, {target_node.feature_index}, Source: {source_layer_}")
-                            plt.savefig(f"results/grads/{target_node.layer_index}_{target_node.token_position}_{target_node.feature_index}.png")
+                            plt.savefig(f"results/grads/{target_node.id}_{source_layer_}.png")
                             plt.close()
+                            # if isinstance(target_node, OutputNode) and source_layer_ == 15:
+                                # exit()
 
                 for layer_idx in range(max_mlp_layer):
                     error_index = 2 + layer_idx * 2
@@ -1289,4 +1334,7 @@ class AttributionQueue:
                 for source_seq, source_idx, weight in zip(source_seqs, source_idces, weights):
                     if weight == 0:
                         continue
+                    if DEBUG and source_seq > 100:
+                        print("SOURCE:", source_seq, source_idx, target_layer, target_seq, target_idx, weight)
+                        print(source_idces, source_seqs)
                     yield layer_idx, source_seq, source_idx, target_layer, target_seq, target_idx, weight
