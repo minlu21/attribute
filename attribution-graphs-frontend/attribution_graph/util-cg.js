@@ -175,6 +175,10 @@ window.utilCg = (function(){
       )
     }
 
+    if (visState.hideErrorNodes) {
+      nodes = nodes.filter(d => d.feature_type !== "mlp reconstruction error")
+    }
+
     nodes.forEach((d, i) => {
       // To make hover state work across prompts, drop ctx from node id
       d.featureId = `${d.layer}_${d.feature}`

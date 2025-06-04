@@ -115,13 +115,28 @@ window.init = async function(){
       .text(parseFloat(visState.pruningThreshold).toFixed(2))
   }
 
+  var hideErrorNodesContainer = controlsContainer.append('div.hide-error-nodes-container')
+    .style('display', 'flex')
+    .style('align-items', 'center')
+    .style('gap', '8px')
+  hideErrorNodesContainer.append('input')
+    .attr('type', 'checkbox')
+    .attr('checked', visState.hideErrorNodes)
+    .on('change', function() {
+      visState.hideErrorNodes = this.checked
+      util.params.set('hideErrorNodes', this.checked)
+      debouncedRender()
+    })
+  hideErrorNodesContainer.append('span').text('Hide error nodes')
+
   function render() {
     d3.select('.cg').html('')
     initCg(d3.select('.cg'), visState.slug, {
       clickedId: visState.clickedId,
       clickedIdCb: id => util.params.set('clickedId', id),
       isGridsnap: visState.isGridsnap || true,
-      pruningThreshold: visState.pruningThreshold
+      pruningThreshold: visState.pruningThreshold,
+      hideErrorNodes: visState.hideErrorNodes
     })
 
     var m = graphs.find(g => g.slug == visState.slug)

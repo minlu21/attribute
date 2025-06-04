@@ -1,4 +1,4 @@
-window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap, pruningThreshold} = {}){
+window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isGridsnap, pruningThreshold, hideErrorNodes} = {}){
   var data = await util.getFile(`/graph_data/${slug}.json`)
   data = structuredClone(data);
   console.log(data)
@@ -22,6 +22,7 @@ window.initCg = async function (sel, slug, {clickedId, clickedIdCb, isModal, isG
     isModal: true,
     isGridsnap,
     pruningThreshold,
+    hideErrorNodes,
     ...data.qParams
   }
 
