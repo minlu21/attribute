@@ -20,52 +20,6 @@ from .nodes import (Contribution, Edge, ErrorNode, InputNode, IntermediateNode,
 from .utils import cantor, measure_time
 
 
-DEBUG = os.environ.get("ATTRIBUTE_DEBUG", "0") == "1"
-if DEBUG:
-    def node_from_index(index: int, edge_matrix: dict, self):
-        try:
-            layer_idx_0, seq_idx_0, feature_idx_0 = edge_matrix["activation_matrix_indices"][index].tolist()
-        except IndexError:
-            err_index = index - edge_matrix["activation_matrix_indices"].shape[0]
-            num_positions = self.cache.original_input_ids.shape[-1]
-            layer_idx_0 = err_index // num_positions
-            seq_idx_0 = err_index % num_positions
-            if layer_idx_0 >= self.model.num_layers:
-                token_index = err_index - (num_positions * self.model.num_layers)
-                if token_index < num_positions:
-                    return f"input_{token_index - 1}"
-                token_index -= num_positions
-                token_id = edge_matrix["logit_tokens"][token_index]
-                return [node.id for node in self.output_nodes if node.token_idx == token_id][0]
-            return f"error_{seq_idx_0 - 1}_{layer_idx_0}"
-        seq_idx_0 = seq_idx_0 - 1
-        if (seq_idx_0, layer_idx_0, feature_idx_0) not in self.intermediate_nodes:
-            print("MISSING NODE:", (seq_idx_0, layer_idx_0, feature_idx_0))
-            return None
-        return self.intermediate_nodes[(seq_idx_0, layer_idx_0, feature_idx_0)].id
-    # def node_from_index(index: int, edge_matrix: dict, self):
-    #     try:
-    #         layer_idx_0, seq_idx_0, feature_idx_0 = edge_matrix["activation_matrix_indices"][index].tolist()
-    #     except IndexError:
-    #         err_index = index - edge_matrix["activation_matrix_indices"].shape[0]
-    #         num_positions = self.cache.original_input_ids.shape[-1]
-    #         layer_idx_0 = err_index // num_positions
-    #         seq_idx_0 = err_index % num_positions
-    #         if layer_idx_0 >= self.model.num_layers:
-    #             token_index = err_index - (num_positions * self.model.num_layers)
-    #             if token_index < num_positions:
-    #                 return f"input_{token_index - 1}"
-    #             token_index -= num_positions
-    #             token_id = edge_matrix["logit_tokens"][token_index]
-    #             return [node.id for node in self.output_nodes if node.token_idx == token_id][0]
-    #         return f"error_{seq_idx_0 - 1}_{layer_idx_0}"
-    #     seq_idx_0 = seq_idx_0 - 1
-    #     if (seq_idx_0, layer_idx_0, feature_idx_0) not in self.intermediate_nodes:
-    #         print("MISSING NODE:", (seq_idx_0, layer_idx_0, feature_idx_0))
-    #         return None
-    #     return self.intermediate_nodes[(seq_idx_0, layer_idx_0, feature_idx_0)].id
-
-
 @dataclass
 class AttributionConfig:
     # name of the run
@@ -87,11 +41,11 @@ class AttributionConfig:
     filter_high_freq_early: float = 0.01
 
     # remove MLP edges below this threshold
-    pre_filter_threshold: float = 1e-5 if not DEBUG else 0.0
+    pre_filter_threshold: float = 1e-5
     # keep edges that make up this fraction of the total influence
     edge_cum_threshold: float = 0.98
     # keep top k edges for each node
-    top_k_edges: int = 32 if not DEBUG else 16384
+    top_k_edges: int = 32
     # whether to multiply by activation strength before computing influence
     influence_anthropic: bool = True
     # whether to compute influence on the GPU
@@ -105,7 +59,7 @@ class AttributionConfig:
     keep_all_error_nodes: bool = False
     keep_all_input_nodes: bool = True
     # debugging: use all nodes as targets
-    use_all_targets: bool = DEBUG
+    use_all_targets: bool = False
 
     # correct for bias when saving top output logits
     use_logit_bias: bool = False
@@ -185,62 +139,6 @@ class AttributionGraph:
                 weight = abs(weight)
             adj_matrix[target_index, source_index] = weight * activation_sources[source_index]
 
-        if  DEBUG:
-            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
-            # pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
-            # edge_scores = pruned_matrix["normalized_pruned"].cpu()
-            # edge_scores = pruned_matrix["pruned_matrix"].cpu()
-            edge_scores = edge_matrix["edge_matrix"].abs().cpu()
-
-            from tqdm import trange
-            from collections import Counter
-            indices_adj = []
-            indices_edge = []
-            n_unused = 0
-            counter = Counter()
-            for i in trange(edge_scores.shape[0]):
-                source_id = node_from_index(i, edge_matrix, self)
-                if source_id is None:
-                    print("UNUSED:", i, i - edge_matrix["activation_matrix_indices"].shape[0])
-                    n_unused += 1
-                    continue
-                if source_id not in dedup_node_indices:
-                    print("NOT INCLUDED:", source_id, edge_scores[:, i].abs().max(), edge_scores[i, :].abs().max())
-                    n_unused += 1
-                    continue
-                counter[dedup_node_indices[source_id]] += 1
-                indices_adj.append(dedup_node_indices[source_id])
-                indices_edge.append(i)
-                if edge_scores[:, i].abs().max() < 1e-5:
-                    print("ZERO COLUMN:", source_id, edge_scores[:, i].abs().max())
-                if edge_scores[i, :].abs().max() < 1e-5:
-                    print("ZERO ROW:", source_id, edge_scores[i, :].abs().max())
-                # for j in range(edge_scores.shape[1]):
-                #     source_id = node_from_index(i)
-                #     target_id = node_from_index(j)
-                #     if source_id is None or target_id is None:
-                #         continue
-                #     if source_id not in dedup_node_indices or target_id not in dedup_node_indices:
-                #         continue
-                #     adj_matrix[dedup_node_indices[target_id], dedup_node_indices[source_id]] = edge_scores[i, j]
-            self.indices_adj = indices_adj
-            print(counter.most_common(10))
-            print(f"{n_unused / edge_scores.shape[0]:.3f}")
-            indices_adj = np.array(indices_adj)
-            indices_edge = np.array(indices_edge)
-            # adj_matrix *= 0
-            # adj_matrix[indices_adj[:, None], indices_adj[None, :]] = edge_scores[indices_edge[:, None], indices_edge[None, :]]
-            # adj_matrix[indices_adj][:, indices_adj] = edge_scores[indices_edge][:, indices_edge]
-            # adj_mgrid = np.meshgrid(indices_adj, indices_adj)
-            # edge_mgrid = np.meshgrid(indices_edge, indices_edge)
-            # adj_matrix[adj_mgrid[0].flatten(), adj_mgrid[1].flatten()] = edge_scores[edge_mgrid[0].flatten(), edge_mgrid[1].flatten()]
-            for i in range(adj_matrix.shape[0]):
-                if np.abs(adj_matrix[i]).sum() < 1e-5:
-                    print("ZERO ROW:", i, np.abs(adj_matrix[i]).sum())
-                    print(dedup_node_names[i], i in indices_adj, edge_scores[indices_edge[indices_adj == i], :].sum())
-                    print(self.nodes[dedup_node_names[i]])
-            # exit()
-
         if normalize:
             adj_matrix /= np.maximum(1e-2, np.nan_to_num(adj_matrix.sum(axis=1, keepdims=True)))
 
@@ -303,18 +201,6 @@ class AttributionGraph:
             if isinstance(node, OutputNode):
                 influence_sources[index] = node.probability
 
-        if DEBUG and False:
-            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
-            logit_weights = edge_matrix["logit_weights"].tolist()
-            # logit_weights = edge_matrix["logit_w"].tolist()
-            logit_tokens = edge_matrix["logit_tokens"].tolist()
-            for index, node in enumerate(dedup_node_names):
-                node = self.nodes[node]
-                if isinstance(node, OutputNode):
-                    output_id = node.token_idx
-                    logit_idx = logit_tokens.index(output_id)
-                    influence_sources[index] = logit_weights[logit_idx]
-
         logger.info("Finding influence matrix")
         original_adj_matrix = adj_matrix.copy()
 
@@ -328,77 +214,6 @@ class AttributionGraph:
 
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
-
-        if DEBUG:
-            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
-            logit_weights = edge_matrix["logit_weights"]
-
-            def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
-                normalized = matrix.abs()
-                return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
-
-            def compute_influence(A):
-                # Calculate total influence using matrix inverse (I - A)^-1 - I
-                identity = torch.eye(A.shape[0], device=A.device)
-                B = torch.inverse(identity - A) - identity
-                return logit_weights @ B.to(logit_weights.device)
-
-            # Calculate node influence and apply threshold
-            # node_influence = compute_influence(normalize_matrix(edge_matrix["edge_matrix"]))
-            pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
-            node_influence = pruned_matrix["node_influence"].cpu().tolist()
-            # act_mat_vals = edge_matrix["activation_matrix_values"].cpu().tolist()
-            # unnormalized = edge_matrix["edge_matrix"].abs().cpu().numpy()
-            # node_sums = unnormalized.sum(axis=1)
-            # inf_sums = np.abs(original_adj_matrix).sum(axis=1)
-
-            xs = []
-            ys = []
-            # for i, (layer_idx, seq_idx, feature_idx) in enumerate(edge_matrix["activation_matrix_indices"].tolist()):
-            #     seq_idx = seq_idx - 1
-            #     try:
-            #         node_id = self.intermediate_nodes[(seq_idx, layer_idx, feature_idx)].id
-            #     except KeyError:
-            #         print("(usage) MISSING NODE:", (seq_idx, layer_idx, feature_idx), act_mat_vals[i])
-            #         continue
-            #     try:
-            #         dedup_node_indices[node_id]
-            #     except KeyError:
-            #         print("(usage) NOT INCLUDED:", node_id, self.nodes[node_id].activation)
-            #         continue
-            counted = set(dedup_node_indices.keys())
-            for i in range(len(node_influence)):
-                node_id = node_from_index(i, edge_matrix, self)
-                if node_id is None or node_id not in dedup_node_indices:
-                    continue
-                counted.remove(node_id)
-                x, y = node_influence[i], usage[dedup_node_indices[node_id]]
-                # x, y = node_sums[i], inf_sums[dedup_node_indices[node_id]]
-                # xs.append(node_influence[i])
-                xs.append(x)
-                # xs.append(act_mat_vals[i])
-                ys.append(y)
-                # ys.append(usage[dedup_node_indices[node_id]])
-                # ys.append(activation_sources[dedup_node_indices[node_id]])
-                # if y <= 0:
-                #     print(node_id, layer_idx, seq_idx, feature_idx, x, y, act_mat_vals[i], activation_sources[dedup_node_indices[node_id]], np.abs(original_adj_matrix[:, dedup_node_indices[node_id]]).sum(), dedup_node_indices[node_id] in self.indices_adj)
-                #     for j, v in enumerate(unnormalized[i]):
-                #         if v > 0:
-                #             node_src = node_from_index(j, edge_matrix, self)
-                #             if node_src is not None and node_src in dedup_node_indices:
-                #                 print("", node_src, node_src in dedup_node_indices, v, original_adj_matrix[dedup_node_indices[node_id], dedup_node_indices[node_src]], dedup_node_indices[node_src] in self.indices_adj)
-            print("Not counted:", counted)
-            from matplotlib import pyplot as plt
-            # plt.xscale("log")
-            # plt.yscale("log")
-            plt.scatter(xs, ys, s=1)
-            plt.plot([1e-5, 1], [1e-5, 1], color="black")
-            plt.xlabel("Theirs")
-            plt.ylabel("Ours")
-            plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1]**2:.3f}")
-            plt.savefig("results/influence_vs_usage.png")
-            plt.close()
-        # exit()
 
         logger.info("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
@@ -457,98 +272,6 @@ class AttributionGraph:
         edge_cumsum = np.cumsum(selected_edge_matrix)
         edge_cumsum = edge_cumsum / edge_cumsum[-1]
 
-        if DEBUG:
-            from matplotlib import pyplot as plt
-            plt.loglog(1 - edge_cumsum)
-            plt.plot([0, 10000], [0.02, 0.02], "k--")
-            plt.savefig("results/edge_cumsum.png")
-            plt.close()
-
-        if DEBUG:
-            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
-            pruned_matrix = torch.load("../circuit-replicate/pruned_graph.pt")
-            mask = pruned_matrix["node_mask"].tolist()
-            total = 0
-            matching = 0
-            accounted_for = filtered_mask.copy()
-            for i, v in enumerate(mask):
-                if v:
-                    total += 1
-                    node = node_from_index(i, edge_matrix, self)
-                    if node is None:
-                        print("NO NODE:", i)
-                        continue
-                    if node in selected_nodes:
-                        matching += 1
-                        accounted_for[dedup_node_indices[node]] = 0
-                    else:
-                        print("WRONG NODE:", i, node, node in selected_nodes, usage[dedup_node_indices[node]], adj_matrix[:, dedup_node_indices[node]].sum())
-            for i, v in enumerate(accounted_for):
-                if v:
-                    print("not accounted for:", i, dedup_node_names[i], usage[i])
-
-            print(f"{matching / total:.3f}", matching, total)
-
-            edge_scores = edge_matrix["edge_matrix"].abs().cpu()
-            # edge_scores = pruned_matrix["normalized"].cpu()
-            # edge_scores = pruned_matrix["normalized_pruned"].cpu()
-            # edge_scores = pruned_matrix["pruned_matrix"].cpu()
-            # edge_scores = pruned_matrix["edge_scores"].cpu()
-            xs = []
-            ys = []
-            colors = []
-            color_to_diff = defaultdict(list)
-            from tqdm import trange
-            for i in trange(edge_scores.shape[0]):
-                source_id = node_from_index(i, edge_matrix, self)
-                if source_id is None or source_id not in dedup_node_indices:
-                    continue
-                if random.random() < 0.85:
-                    continue
-                for j in range(edge_scores.shape[1]):
-                    if random.random() < 0.85:
-                        continue
-                    score = float(edge_scores[i, j])
-                    if score == 0:
-                        continue
-                    target_id = node_from_index(j, edge_matrix, self)
-                    if target_id is None or target_id not in dedup_node_indices:
-                        continue
-                    source_node = self.nodes[source_id]
-                    target_node = self.nodes[target_id]
-
-                    x, y = np.abs(score), np.abs(original_adj_matrix[dedup_node_indices[source_id], dedup_node_indices[target_id]])
-                    xs.append(x)
-                    ys.append(y)
-                    if isinstance(source_node, IntermediateNode) and isinstance(target_node, IntermediateNode):
-                        colors.append("green")
-                    elif isinstance(target_node, ErrorNode):
-                        colors.append("red")
-                    elif isinstance(target_node, InputNode):
-                        colors.append("blue")
-                    elif isinstance(target_node, IntermediateNode):
-                        colors.append("yellow")
-                    else:
-                        colors.append("black")
-                    color_to_diff[colors[-1]].append(np.abs(np.log(x) - np.log(y)))
-            from matplotlib import pyplot as plt
-            plt.scatter(xs, ys, s=1, c=colors)
-            y_min, y_max = min(ys), max(ys)
-            plt.plot([y_min, y_max], [y_min, y_max], color="black")
-            plt.xscale("log")
-            plt.yscale("log")
-            plt.xlabel("Theirs")
-            plt.ylabel("Ours")
-            plt.savefig("results/influence_vs_score.png")
-            plt.close()
-            # bins = np.logspace(-5, 0, 100)
-            bins = np.linspace(0, 5, 100)
-            for color, diffs in color_to_diff.items():
-                plt.hist(diffs, bins=bins, label=color, density=True)
-            plt.legend()
-            plt.savefig("results/influence_vs_score_hist.png")
-            plt.close()
-            print("AAAAAAA")
         edge_threshold = selected_edge_matrix[np.searchsorted(edge_cumsum, self.config.edge_cum_threshold)]
         logger.info(f"Edge threshold: {edge_threshold}")
 
@@ -1082,12 +805,8 @@ class AttributionGraph:
             backward_to,
             [gradient],
             retain_graph=True,
-            allow_unused=DEBUG,
+            allow_unused=False,
         )
-
-        if DEBUG:
-            edge_matrix = torch.load("../circuit-replicate/edge_matrix.pt")
-            mlp_indices = edge_matrix["activation_matrix_indices"].tolist()
 
         with measure_time("Summarizing contributions of node", disabled=True), torch.no_grad():
             for batch_idx, (target_node, influence) in enumerate(zip(target_nodes, influences)):
@@ -1101,89 +820,6 @@ class AttributionGraph:
                         target=target_node,
                         contribution=contribution.to(device="cpu", non_blocking=True),
                     ))
-
-                error_grads = {}
-                if False and DEBUG and target_node.layer_index > 0:
-                    target_index = None
-                    if isinstance(target_node, IntermediateNode):
-                        try:
-                            target_index = mlp_indices.index([target_node.layer_index, target_node.token_position + 1, target_node.feature_index])
-                        except ValueError:
-                            pass
-                    elif isinstance(target_node, OutputNode):
-                        token_idx = [i for i, e in enumerate(edge_matrix["logit_tokens"]) if e == target_node.token_idx][0]
-                        # target_index = len(mlp_indices) + self.model.num_layers * self.cache.original_input_ids.shape[1] + token_idx
-                        # batch_size = 64
-                        length_padded = 9000
-                        print("PADDED:", length_padded)
-                        target_index = length_padded + token_idx
-                    else:
-                        pass
-                    # if target_index is not None:
-                        # layer_idx = target_node.layer_index - 1
-                    for layer_idx in (range(target_node.layer_index) if target_index is not None else []):
-                        error_index = 2 + layer_idx * 2
-                        error_grad, error_val = gradients[error_index], backward_to[error_index]
-                        if error_grad is None:
-                            continue
-
-                        error_grad_ = error_grad[batch_idx, -true_seq_len:]
-                        cache_path = Path("../circuit-replicate/grads")
-                        from natsort import natsorted
-                        u = True
-                        for pt_file in natsorted(cache_path.glob("*.pt")):
-                            # grads_blocks.0.mlp.hook_out_3691_3698.pt
-                            import re
-                            try:
-                                source_layer_, start_target, end_target = re.match(r"grads_blocks\.([0-9]+)\.mlp\.hook_out_([0-9]+)_([0-9]+)\.pt", pt_file.name).groups()
-                                # source_layer_, start_target, end_target = re.match(r"grads_blocks\.([0-9]+)\.hook_resid_mid_([0-9]+)_([0-9]+)\.pt", pt_file.name).groups()
-                                # source_layer_, start_target, end_target = re.match(r"grads_blocks\.([0-9]+)\.hook_resid_pre_([0-9]+)_([0-9]+)\.pt", pt_file.name).groups()
-                                source_layer_ = int(source_layer_)
-                                start_target = int(start_target)
-                                end_target = int(end_target)
-                                # source_layer_ -= 1
-                                if source_layer_ == 0:
-                                    continue
-                            except AttributeError:
-                                continue
-
-                            if layer_idx != source_layer_:
-                                continue
-                            if target_index < start_target or target_index >= end_target:
-                                continue
-                            break
-                        else:
-                            u = False
-                        # if isinstance(target_node, OutputNode):
-                        #     print(target_node, target_index, u, start_target, end_target)
-                        #     exit()
-                        if u:
-                            print("match:", target_node.id, target_index, u, start_target, end_target, pt_file)
-
-                            pt_file = torch.load(pt_file, weights_only=False)
-                            index_of_target = target_index - start_target
-                            assert end_target - start_target <= pt_file["grads"].shape[0]
-
-                            gradients_ = pt_file["grads"][index_of_target]
-                            error_grads[layer_idx] = gradients_
-
-                            xs = error_grad_.detach().cpu().flatten().float().numpy()
-                            ys = gradients_[1:].detach().cpu().flatten().float().numpy()
-                            mask = ys != 0
-                            xs = xs[mask]
-                            ys = ys[mask]
-                            min_xy = min(xs.min(), ys.min())
-                            max_xy = max(xs.max(), ys.max())
-                            bound = max(abs(min_xy), abs(max_xy))
-                            from matplotlib import pyplot as plt
-                            plt.scatter(xs, ys)
-                            plt.xlim(-bound, bound)
-                            plt.ylim(-bound, bound)
-                            os.makedirs("results/grads", exist_ok=True)
-                            plt.savefig(f"results/grads/{target_node.id}_{source_layer_}.png")
-                            plt.close()
-                            # if isinstance(target_node, OutputNode) and source_layer_ == 15:
-                                # exit()
 
                 for layer_idx in range(max_mlp_layer):
                     error_index = 2 + layer_idx * 2
@@ -1209,9 +845,6 @@ class AttributionGraph:
                         continue
                     edge_indices = torch.topk(edge.flatten(), n_elem).indices
                     edge_seq, edge_k = edge_indices // edge.shape[-1], edge_indices % edge.shape[-1]
-                    # if DEBUG and layer_idx == 15:
-                    #     print("!!!!", edge_seq, edge_k)
-                    #     exit()
                     edge_feat = self.cache.mlp_outputs[layer_idx].location[batch_idx, -true_seq_len:].flatten()[edge_indices]
                     edge_val = mlp_grad[edge_seq, edge_k]
                     self.queue.layers[layer_idx].edge_source_seq.append(edge_seq.to("cpu", non_blocking=True))
@@ -1241,11 +874,6 @@ class AttributionGraph:
                     target = self.output_nodes[-1 - target_idx]
                 else:
                     target = self.intermediate_nodes[(target_seq, target_layer, target_idx)]
-                if DEBUG and isinstance(source, IntermediateNode) and source.layer_index == 15 and source.token_position < 5:
-                    print("SOURCE:",source)
-                # if isinstance(target, IntermediateNode) and target.layer_index == 15:
-                #     print(target)
-                #     1/0
                 edge = Edge(
                     source=source,
                     target=target,
@@ -1334,7 +962,4 @@ class AttributionQueue:
                 for source_seq, source_idx, weight in zip(source_seqs, source_idces, weights):
                     if weight == 0:
                         continue
-                    if DEBUG and source_seq > 100:
-                        print("SOURCE:", source_seq, source_idx, target_layer, target_seq, target_idx, weight)
-                        print(source_idces, source_seqs)
                     yield layer_idx, source_seq, source_idx, target_layer, target_seq, target_idx, weight

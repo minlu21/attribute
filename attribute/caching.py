@@ -21,9 +21,6 @@ from loguru import logger
 LlamaLike = LlamaPreTrainedModel | Qwen2PreTrainedModel | Gemma2PreTrainedModel
 GPT2Like = GPT2PreTrainedModel | GPTNeoPreTrainedModel
 
-DEBUG = os.environ.get("ATTRIBUTE_DEBUG", "0") == "1"
-UNFREEZE = os.environ.get("ATTRIBUTE_DEBUG_UNFREEZE", "0") == "1"
-
 
 @dataclass
 class MLPOutputs:
@@ -136,8 +133,6 @@ class TranscodedModel(object):
                     transcoder_path / temp_hookpoint,
                     device=device,
                 )
-            if DEBUG:
-                sae = sae.to(torch.bfloat16)
             sae.requires_grad_(False)
             self.transcoders[hookpoint] = sae
         for hookpoint, temp_hookpoint in zip(self.hookpoints_mlp, self.temp_hookpoints_mlp):
@@ -196,8 +191,6 @@ class TranscodedModel(object):
         self.clear_hooks()
 
         def ln_record_hook(module, input, output):
-            if UNFREEZE:
-                return output
             if "rmsnorm" in type(module).__name__.lower():
                 mean = 0
             else:
@@ -212,8 +205,6 @@ class TranscodedModel(object):
             ln = getattr(self.name_to_module[hookpoint], self.attn_layernorm_name)
             ln.register_forward_hook(ln_record_hook)
             self.freeze_attention_pattern(hookpoint)
-            # if DEBUG:
-            #     self.attn(self.name_to_index[hookpoint]).register_forward_hook(lambda _m, _i, o: (o[0].detach(),) + o[1:])
 
         for hookpoint in self.additional_ln:
             self.name_to_module[hookpoint].register_forward_hook(ln_record_hook)
@@ -251,25 +242,6 @@ class TranscodedModel(object):
             if self.pre_ln_hook:
                 input = resid_mid[layer_idx]
             output = output.detach()
-            # if DEBUG:
-            #     input = input.detach()
-
-            if DEBUG:
-                mlp_in_path = f"../circuit-replicate/mlp_in_{layer_idx}.pt"
-                # mlp_in_path = f"experiments/results/mlp_in_{layer_idx}.pt"
-                input_recorded = torch.load(mlp_in_path)
-                # from matplotlib import pyplot as plt
-                # import numpy as np
-                # xs = input[:1, 1:].detach().flatten().cpu().float().numpy()
-                # ys = input_recorded[:1, 1:].detach().flatten().cpu().float().numpy()
-                # plt.scatter(xs, ys)
-                # plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1] ** 2}")
-                # plt.savefig(f"results/mlp_in_{layer_idx}.png")
-                # plt.close()
-
-                # input = (input - input.detach()) + input_recorded
-                # print(input.shape, input_recorded.shape)
-                input[:, 1:] = ((input - input.detach()) + input_recorded)[:, 1:]
 
             if self.offload:
                 if module_name in self.transcoders:
@@ -280,36 +252,7 @@ class TranscodedModel(object):
             batch_dims = input.shape[:-1]
             input = input.view(-1, input.shape[-1])
             with torch.set_grad_enabled(not self.offload):
-                if DEBUG and False:
-                    trans_acts = torch.load(f"../circuit-replicate/transcoder_acts_{layer_idx}.pt")
-                    transcoder.encoder.weight.data = trans_acts["W_enc"].T#.contiguous()
-                    transcoder.encoder.bias.data = trans_acts["b_enc"]
-                    transcoder.b_dec.data = trans_acts["b_dec"]
-                    transcoder.W_dec.data = trans_acts["W_dec"]
-                    input = input.to(transcoder.encoder.weight.dtype)
-                    input = trans_acts["inputs"][:1, :, :].repeat(batch_dims[0], 1, 1).flatten(0, 1) + (input - input.detach())
-
-                    # pre_acts = torch.nn.functional.linear(input.unflatten(0, batch_dims)[0, 1:], transcoder.encoder.weight, transcoder.encoder.bias).relu()
-
-                    pre_acts = (input.unflatten(0, batch_dims)[0, 1:] @ transcoder.encoder.weight.T + transcoder.encoder.bias).relu()
-                    # pre_acts = (input @ transcoder.encoder.weight.T + transcoder.encoder.bias).relu()
-                    # pre_acts = pre_acts.unflatten(0, batch_dims)[0, 1:]
-
-                    # print(pre_acts - trans_acts["acts"])
-                    # print(torch.abs(pre_acts - trans_acts["acts"][1:]).max(dim=-1).values.tolist())
                 transcoder_acts = runner.encode(input, transcoder)
-                if DEBUG and False:
-                    # pre_acts = (input @ transcoder.encoder.weight.T + transcoder.encoder.bias).relu()
-                    pre_acts = (input @ trans_acts["W_enc"] + transcoder.encoder.bias)
-                    acts = trans_acts["acts"]
-                    acts = acts.unsqueeze(0).repeat(batch_dims[0], 1, 1).flatten(0, 1)
-                    pre_acts = (pre_acts - pre_acts.detach()) + acts
-                    # print(torch.abs(pre_acts.unflatten(0, batch_dims)[0, 1:] - trans_acts["acts"][1:]).max(dim=-1).values.tolist())
-                    latent_acts, latent_indices = torch.topk(pre_acts, transcoder_acts.latent_acts.shape[-1], dim=-1)
-                    if True:
-                        transcoder_acts.latent_acts = latent_acts
-                        transcoder_acts.latent_indices = latent_indices
-                    print(transcoder_acts.latent_acts.shape)
             if self.offload:
                 pad_to = 256
 
@@ -400,12 +343,6 @@ class TranscodedModel(object):
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
 
-            # if DEBUG:
-                # error_path = f"../circuit-replicate/error_{layer_idx}.pt"
-                # error_recorded = torch.load(error_path)
-                # diff[:, 1:] = ((diff - diff.detach()) + error_recorded)[:, 1:]
-                # diff = ((diff - diff.detach()) + error_recorded)
-
             if no_error:
                 error = torch.zeros_like(output)
             elif errors_from is None:
@@ -413,35 +350,6 @@ class TranscodedModel(object):
             else:
                 error = errors_from.mlp_outputs[layer_idx].error
 
-            if DEBUG and False:
-                with torch.no_grad():
-                    from matplotlib import pyplot as plt
-                    import numpy as np
-                    out_recorded = torch.load(f"../circuit-replicate/reconstruction_{layer_idx}.pt")
-                    xs = out_recorded[:1, 1:].flatten().cpu().float().numpy()
-                    ys = transcoder_out[:1, 1:].flatten().cpu().float().numpy()
-                    ymin, ymax = np.min(ys), np.max(ys)
-                    plt.scatter(xs, ys, s=1)
-                    plt.xlabel("Recorded")
-                    plt.ylabel("Ours")
-                    plt.ylim(ymin, ymax)
-                    plt.xlim(ymin, ymax)
-                    plt.title(f"R^2: {np.corrcoef(xs, ys)[0, 1] ** 2}")
-                    plt.savefig(f"results/output_vs_recorded_{layer_idx}.png")
-                    plt.close()
-
-
-                    err_recorded = torch.load(f"../circuit-replicate/error_{layer_idx}.pt")
-                    xs = err_recorded[:1, 1:].flatten().cpu().float().numpy()
-                    ys = error[:1, 1:].flatten().cpu().float().numpy()
-                    ymin, ymax = np.min(ys), np.max(ys)
-                    plt.scatter(xs, ys, s=1)
-                    plt.xlabel("Recorded")
-                    plt.ylabel("Ours")
-                    plt.ylim(ymin, ymax)
-                    plt.xlim(ymin, ymax)
-                    plt.savefig(f"results/error_vs_recorded_{layer_idx}.png")
-                    plt.close()
             error = error.clone()
             error.detach_()
             error.requires_grad_(True)
@@ -457,8 +365,6 @@ class TranscodedModel(object):
             # if errors_from is None and not no_error:
                 # result = output.detach() + (result - result.detach())
             errors[module_name] = error
-            # if DEBUG and layer_idx != 14:
-            #     result = result.detach()
             return result
 
         for hookpoint in self.hookpoints_mlp_post:
@@ -751,8 +657,6 @@ class TranscodedModel(object):
         return self.tokenizer.decode([token_id])
 
     def freeze_attention_pattern(self, hookpoint: str):
-        if UNFREEZE:
-            return
         index = self.name_to_index[hookpoint]
         def freeze_slice(module, input, output, start, end):
             if start == 0 and end == output.shape[-1]:
