@@ -27,14 +27,26 @@ torch._functorch.config.donated_buffer=False
 MODEL_OPTIONS = [
     dict(model_name="meta-llama/Llama-3.2-1B",
          model_id="llama3.2-1b",
+         slug="llama3.2-1b-relu",
          transcoder_path="EleutherAI/Llama-3.2-1B-mntss-skip-transcoder",
          cache_path="results/transcoder-llama-131k-mntss/latents",
          scan="transcoder-llama-131k-mntss",
          remove_prefix=1,
          num_layers=16,
-         hook_resid_mid=True),
+         pre_ln_hook=True),
+    dict(model_name="google/gemma-2-2b",
+         model_id="gemma-2-2b",
+         slug="gemma-2-2b-gemmascope",
+         transcoder_path="EleutherAI/gemmascope-transcoders-sparsify",
+        #  cache_path="results/gemmascope-transcoders-sparsify-1m/latents",
+         cache_path="results/gemmascope-transcoders-sparsify-nowhere/latents",
+         scan="gemmascope-transcoders-sparsify",
+         remove_prefix=1,
+         num_layers=26,
+         post_ln_hook=True),
     dict(model_name="HuggingfaceTB/SmolLM2-135M",
          model_id="smollm2-135m",
+         slug="smollm2-135m-clt",
          transcoder_path="EleutherAI/SmolLM2-CLT-135M-73k-k32",
          cache_path="results/smollm-v1/latents",
          scan="smollm-v1",
@@ -62,7 +74,7 @@ except NameError:
     model_cache = {}
 running_contexts = set()
 default_config = AttributionConfig(
-    flow_steps=500,
+    flow_steps=5000,
     name=None,
     scan=None,
 )
@@ -89,7 +101,8 @@ def generate(session, run_name, model_name, prompt):
                 model_cfg["transcoder_path"],
                 device="cuda",
                 offload=OFFLOAD_TRANSCODER,
-                pre_ln_hook=model_cfg.get("hook_resid_mid", False),
+                pre_ln_hook=model_cfg.get("pre_ln_hook", False),
+                post_ln_hook=model_cfg.get("post_ln_hook", False),
             )
         config = replace(default_config, name=run_name, scan=model_cfg["scan"])
         model = model_cache[model_name]
@@ -187,7 +200,9 @@ def upload_to_neuronpedia(circuit_file, model_name, neuronpedia_api_key):
         circuit_text = json.dumps(circuit_json)
         graph_metadata = NPGraphMetadata.upload(circuit_text)
         result_url = graph_metadata.url
-        return f"Uploaded to Neuronpedia: {result_url}"
+        result_url_embed = result_url + "&embed=true"
+        result_embed = f'<iframe width="100%" style="height: 100vh" src="{result_url_embed}"></iframe>'
+        return [f"Uploaded to Neuronpedia: {result_url}", result_embed]
 
 def update_logs(session):
     if not (session or {}).get("something_is_running"):
@@ -227,7 +242,8 @@ def main():
         neuronpedia_api_key.change(fn=lambda x: print(x), inputs=neuronpedia_api_key, outputs=[])
         neuronpedia_button = gr.Button("Upload to Neuronpedia")
         neuronpedia_result = gr.Markdown()
-        neuronpedia_button.click(upload_to_neuronpedia, inputs=[circuit_file, model_dropdown, neuronpedia_api_key], outputs=neuronpedia_result)
+        neuronpedia_result_embed = gr.HTML(label="Neuronpedia embed", min_height="100vh")
+        neuronpedia_button.click(upload_to_neuronpedia, inputs=[circuit_file, model_dropdown, neuronpedia_api_key], outputs=[neuronpedia_result, neuronpedia_result_embed])
 
         inputs = [
             session,
