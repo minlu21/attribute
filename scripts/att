@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
-PROMPT_NAME="basketball-llama"
+PROMPT_NAME="test-gpt2"
+# PROMPT_NAME="basketball-llama"
 # PROMPT_NAME="basketball-gemma"
 # PROMPT_NAME="basketball-smollm"
 # PROMPT_NAME="basketball-llama-base"
 # SCAN=transcoder_llama_131k_highbs_v0
-SCAN=transcoder-llama-131k-mntss
+# SCAN=transcoder-llama-131k-mntss
+SCAN=bs8-lr2e-4-none-ef128-k16
 # SCAN=gemmascope
 # SCAN=transcoder_llama_131k_mntss_kl
 # SCAN=transcoder-llama-131k-adam-kl
@@ -13,14 +15,15 @@ SCAN=transcoder-llama-131k-mntss
 # SCAN=transcoder-llama-131k-adam-highbs
 # SCAN=smollm-v1
 set -e
-PROMPT_TEXT="Michael Jordan plays the sport of"
+PROMPT_TEXT="Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
 uv run python -m attribute \
 --cache_path=results/$SCAN/latents \
 --name $PROMPT_NAME \
 --scan "$SCAN" \
 "$PROMPT_TEXT" \
 $@ \
---transcoder_path="results/llama-mntss-relu" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 --pre_ln_hook=True --force_k=512 --filter_high_freq_early=0.0
+--transcoder_path="/mnt/ssd-1/nev/e2e/checkpoints/gpt2-sweep/$SCAN" --model_name="openai-community/gpt2" \
+# --transcoder_path="results/llama-mntss-relu" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 --pre_ln_hook=True --force_k=512 --filter_high_freq_early=0.0
 # --transcoder_path="results/gemma-scope-2b-pt-transcoders" --model_name="google/gemma-2-2b" --remove_prefix 1 --post_ln_hook=True \
 # --transcoder_path="/mnt/ssd-1/nev/e2e/checkpoints/llama/adam-highbs" --model_name="meta-llama/Llama-3.2-1B" --remove_prefix 1 \
 # --transcoder_path="/mnt/ssd-1/nev/e2e/checkpoints/smollm/k32" --model_name="HuggingFaceTB/SmolLM2-135M" \

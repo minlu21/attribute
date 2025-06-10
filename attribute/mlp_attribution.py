@@ -13,6 +13,7 @@ from delphi.latents import LatentDataset
 from loguru import logger
 from tqdm.auto import tqdm, trange
 from jaxtyping import Float, Int, Bool, Array
+from simple_parsing import Serializable
 
 from .caching import TranscodedModel, TranscodedOutputs
 from .nodes import (Contribution, Edge, ErrorNode, InputNode, IntermediateNode,
@@ -71,6 +72,20 @@ class AttributionConfig:
     selfe_n: int = 64
     selfe_pick: int = 5
     selfe_n_tokens: int = 8
+
+
+@dataclass
+class SaveResults(Serializable):
+    completeness_score: float
+    replacement_score: float
+    completeness_score_unpruned: float
+    replacement_score_unpruned: float
+    num_nodes: int
+    num_edges: int
+    node_threshold: float
+    edge_threshold: float
+    node_cum_threshold: float
+    config: AttributionConfig
 
 
 class AttributionGraph:
@@ -180,10 +195,7 @@ class AttributionGraph:
             adj_matrix = adj_matrix / np.maximum(1e-2, adj_matrix.sum(axis=1, keepdims=True))
         return influence, adj_matrix
 
-    def save_graph(self, save_dir: os.PathLike):
-        save_dir = Path(save_dir)
-        logger.info("Saving graph to", save_dir)
-
+    def save_graph(self, save_dir: os.PathLike | None) -> SaveResults | None:
         adj_matrix, dedup_node_names, activation_sources = self.adjacency_matrix(absolute=True, normalize=False)
         dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
 
@@ -206,11 +218,11 @@ class AttributionGraph:
 
         influence, adj_matrix = self.find_influence(adj_matrix)
 
-        total_error_influence = 1 - (influence_sources @ adj_matrix) @ error_mask
-        logger.info(f"Completeness score (unpruned): {total_error_influence:.3f}")
+        completeness_score_unpruned = 1 - (influence_sources @ adj_matrix) @ error_mask
+        logger.info(f"Completeness score (unpruned): {completeness_score_unpruned:.3f}")
 
-        total_error_influence = 1 - (influence_sources @ influence) @ error_mask
-        logger.info(f"Replacement score (unpruned): {total_error_influence:.3f}")
+        replacement_score_unpruned = 1 - (influence_sources @ influence) @ error_mask
+        logger.info(f"Replacement score (unpruned): {replacement_score_unpruned:.3f}")
 
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
@@ -265,10 +277,10 @@ class AttributionGraph:
         filtered_node_influence = influence_sources[filtered_mask] @ filtered_influence
         filtered_influence = filtered_adj_matrix * (filtered_node_influence + influence_sources[filtered_mask])[None, :]
 
-        total_pruned_influence = float(1 - (influence_sources[filtered_mask] @ filtered_adj_matrix) @ error_mask[filtered_mask])
-        logger.info(f"Completeness score: {total_pruned_influence:.3f}")
-        total_pruned_influence = float(1 - filtered_node_influence @ error_mask[filtered_mask])
-        logger.info(f"Replacement score: {total_pruned_influence:.3f}")
+        completeness_score = float(1 - (influence_sources[filtered_mask] @ filtered_adj_matrix) @ error_mask[filtered_mask])
+        logger.info(f"Completeness score: {completeness_score:.3f}")
+        replacement_score = float(1 - filtered_node_influence @ error_mask[filtered_mask])
+        logger.info(f"Replacement score: {replacement_score:.3f}")
 
         selected_edge_matrix = np.sort(filtered_influence.flatten())[::-1]
         edge_cumsum = np.cumsum(selected_edge_matrix)
@@ -373,6 +385,23 @@ class AttributionGraph:
                 # sg_pos="",
             )
         )
+
+        if save_dir is None:
+            return SaveResults(
+                completeness_score=completeness_score,
+                replacement_score=replacement_score,
+                completeness_score_unpruned=completeness_score_unpruned,
+                replacement_score_unpruned=replacement_score_unpruned,
+                num_nodes=len(export_nodes),
+                num_edges=len(export_edges),
+                node_threshold=node_threshold,
+                edge_threshold=edge_threshold,
+                node_cum_threshold=self.config.node_cum_threshold,
+                config=self.config
+            )
+
+        save_dir = Path(save_dir)
+        logger.info("Saving graph to", save_dir)
 
         graph_data_dir = save_dir / "graph_data"
         graph_data_dir.mkdir(parents=True, exist_ok=True)
