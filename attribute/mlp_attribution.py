@@ -902,7 +902,10 @@ class AttributionGraph:
 
         if mlp_source:
             for source_layer, source_seq, source_idx, target_layer, target_seq, target_idx, weight in self.queue.purge():
-                source = self.intermediate_nodes[(source_seq, source_layer, source_idx)]
+                try:
+                    source = self.intermediate_nodes[(source_seq, source_layer, source_idx)]
+                except KeyError:
+                    continue
                 if target_idx < 0:
                     target = self.output_nodes[-1 - target_idx]
                 else:

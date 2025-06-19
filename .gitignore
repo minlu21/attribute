@@ -7,3 +7,4 @@ attribution_graph.json
 uv.lock
 delphi.log
 /.gradio
+*.egg-info/
