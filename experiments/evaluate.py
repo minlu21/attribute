@@ -7,6 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from collections import OrderedDict
 
+import sys
+sys.path.append("..")
+
 import IPython
 if ip := IPython.get_ipython():
     ip.run_line_magic("load_ext", "autoreload")
