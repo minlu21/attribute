@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import torch
 from jaxtyping import Array, Float, Int
@@ -182,7 +183,8 @@ class TranscodedModel(object):
                  steer_features: dict[int, list[(int, int, float)]] = {},
                  errors_from: TranscodedOutputs | None = None,
                  latents_from_errors: bool = False,
-                 no_error: bool = False) -> TranscodedOutputs:
+                 no_error: Literal[False, "none", "all", "after_first"] = "none"
+                ) -> TranscodedOutputs:
         if isinstance(prompt, str):
             tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
             logger.info(f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt.input_ids[0]]}")
@@ -196,7 +198,6 @@ class TranscodedModel(object):
         self.clear_hooks()
 
         def ln_record_hook(module, input, output):
-            return output
             if "rmsnorm" in type(module).__name__.lower():
                 mean = 0
             else:
@@ -359,8 +360,12 @@ class TranscodedModel(object):
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
 
-            if no_error:
-                error = torch.zeros_like(output)
+            if no_error not in (False, "none"):
+                if no_error == "after_first":
+                    error = diff.clone()
+                    error[:, 1:] = 0
+                else:
+                    error = torch.zeros_like(output)
             elif errors_from is None:
                 error = diff
             else:
