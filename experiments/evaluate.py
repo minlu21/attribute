@@ -241,7 +241,11 @@ def main():
 
                 # Calculate attribution scores if requested (only on first batch to avoid excessive computation)
                 if (args.calculate_completeness or args.calculate_replacement) and batch_idx == 0:
+                    print(f"Starting attribution score calculation...")
+                    print(f"calculate_completeness: {args.calculate_completeness}")
+                    print(f"calculate_replacement: {args.calculate_replacement}")
                     try:
+                        print(f"Calling calculate_attribution_scores...")
                         attribution_scores = calculate_attribution_scores(
                             model, 
                             input_ids[0:1],  # Use first example only for efficiency
@@ -249,19 +253,22 @@ def main():
                             pre_ln_hook=args.pre_ln_hook,
                             post_ln_hook=args.post_ln_hook
                         )
+                        print(f"Attribution scores calculated: {attribution_scores}")
                         
                         if args.calculate_completeness:
                             completeness_score = attribution_scores['completeness_score']
                             completeness_scores.append(completeness_score)
-                            logger.info(f"Completeness score: {completeness_score:.4f}")
+                            print(f"Completeness score: {completeness_score:.4f}")
                         
                         if args.calculate_replacement:
                             replacement_score = attribution_scores['replacement_score']
                             replacement_scores.append(replacement_score)
-                            logger.info(f"Replacement score: {replacement_score:.4f}")
+                            print(f"Replacement score: {replacement_score:.4f}")
                             
                     except Exception as e:
-                        logger.warning(f"Failed to calculate attribution scores: {e}")
+                        print(f"Failed to calculate attribution scores: {e}")
+                        import traceback
+                        traceback.print_exc()
                         if args.calculate_completeness:
                             completeness_scores.append(None)
                         if args.calculate_replacement:
@@ -288,10 +295,15 @@ def main():
     
     # Add attribution scores to results if calculated
     results_extra = {}
+    print(f"Final completeness_scores: {completeness_scores}")
+    print(f"Final replacement_scores: {replacement_scores}")
     if completeness_scores and completeness_scores[0] is not None:
         results_extra["completeness_score"] = completeness_scores[0]
+        print(f"Adding completeness_score to results: {completeness_scores[0]}")
     if replacement_scores and replacement_scores[0] is not None:
         results_extra["replacement_score"] = replacement_scores[0]
+        print(f"Adding replacement_score to results: {replacement_scores[0]}")
+    print(f"results_extra: {results_extra}")
 
     # Prepare comprehensive results dictionary
     results = {
@@ -318,6 +330,12 @@ def main():
         },
         **results_extra
     }
+    
+    print(f"Final results dictionary keys: {list(results.keys())}")
+    if "completeness_score" in results:
+        print(f"completeness_score in results: {results['completeness_score']}")
+    if "replacement_score" in results:
+        print(f"replacement_score in results: {results['replacement_score']}")
 
     # Save results with timestamp for tracking experiments
     output_dir = Path(args.output_path)
