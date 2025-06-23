@@ -54,6 +54,8 @@ def parse_args():
                       help='Calculate replacement score (requires transcoder)')
     parser.add_argument('--remove_prefix', type=int, default=0,
                       help='Number of tokens to remove from the beginning (similar to serve.py)')
+    parser.add_argument('--monitor_memory', action='store_true',
+                      help='Monitor CUDA memory usage during evaluation')
     return parser.parse_args()
 
 def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_hook=False, post_ln_hook=False, remove_prefix=0):
@@ -171,6 +173,10 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         # Calculate replacement score: 1 - (influence_sources @ influence) @ error_mask
         # This measures the fraction of end-to-end paths that don't go through error nodes
         replacement_score = 1 - (influence_sources @ influence) @ error_mask
+        
+        # Clear CUDA cache after attribution calculations
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return {
             'completeness_score': float(completeness_score),
@@ -308,7 +314,16 @@ def main():
                                 if args.calculate_replacement:
                                     sample_replacement = attribution_scores['replacement_score']
                                     replacement_scores.append(sample_replacement)
-                                    
+                            
+                            # Clear gradients and cache after attribution calculation
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                # Clear gradients from the model
+                                for param in model.parameters():
+                                    if param.grad is not None:
+                                        param.grad.detach_()
+                                        param.grad.zero_()
+                                        
                         except Exception as e:
                             print(f"Failed to calculate attribution scores for sample {len(samples)}: {e}")
                             if args.calculate_completeness:
@@ -317,6 +332,10 @@ def main():
                             if args.calculate_replacement:
                                 replacement_scores.append(0.0)
                                 sample_replacement = 0.0
+                            
+                            # Clear cache even if attribution failed
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                     else:
                         # Add None values if not calculating attribution scores
                         if args.calculate_completeness:
@@ -335,6 +354,21 @@ def main():
                         "replacement_score": sample_replacement
                     }
                     sample_metrics.append(sample_metric)
+
+                    # Clear CUDA cache after each sample to prevent memory accumulation
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        # Also clear any gradients that might be lingering
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                param.grad.detach_()
+                                param.grad.zero_()
+                        
+                        # Monitor memory usage if requested
+                        if args.monitor_memory:
+                            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                            reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                            print(f"Sample {len(samples)} - CUDA Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
                 # Update progress bar with current and running average metrics
                 postfix = {
