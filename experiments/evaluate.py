@@ -218,10 +218,13 @@ def main():
     )
 
     # Track metrics across batches
-    accuracies = []  # Token-level accuracy
-    kl_divs = []    # KL divergence between predicted and true distributions
-    completeness_scores = []  # Completeness scores
-    replacement_scores = []   # Replacement scores
+    accuracies = []  # Token-level accuracy per sample
+    kl_divs = []    # KL divergence per sample
+    completeness_scores = []  # Completeness scores per sample
+    replacement_scores = []   # Replacement scores per sample
+    samples = []     # Sample texts
+    outputs = []     # Model outputs
+    sample_metrics = []  # Detailed metrics per sample
 
     def mlp_trimmer(module, input, output):
         values, indices = torch.topk(output, args.mlp_trim, dim=-1)
@@ -236,89 +239,117 @@ def main():
         bar = tqdm(dataloader, desc="Evaluating", total=args.max_steps)
         for batch_idx, batch in enumerate(bar):
             input_ids = batch["input_ids"].to(model.device)
-            with torch.no_grad():
-                out_base = model.model(input_ids)
-                base_logits = out_base.logits
-                if args.mlp_trim > 0:
-                    for layer_idx in range(model.num_layers):
-                        mlp = model.model.get_submodule(f"{model.layer_prefix}.{layer_idx}.mlp")
-                        in_proj = getattr(mlp, model.mlp_in_proj_name)
-                        in_proj.register_forward_hook(mlp_trimmer)
-                    out = model.model(input_ids)
-                    for m in model.model.modules():
-                        m._forward_hooks = OrderedDict()
-                else:
-                    out = model(input_ids, no_error="after_first")
-                logits = out.logits
+            
+            # Process each sample in the batch
+            for sample_idx in range(input_ids.shape[0]):
+                sample_input_ids = input_ids[sample_idx:sample_idx+1]
+                
+                with torch.no_grad():
+                    out_base = model.model(sample_input_ids)
+                    base_logits = out_base.logits
+                    if args.mlp_trim > 0:
+                        for layer_idx in range(model.num_layers):
+                            mlp = model.model.get_submodule(f"{model.layer_prefix}.{layer_idx}.mlp")
+                            in_proj = getattr(mlp, model.mlp_in_proj_name)
+                            in_proj.register_forward_hook(mlp_trimmer)
+                        out = model.model(sample_input_ids)
+                        for m in model.model.modules():
+                            m._forward_hooks = OrderedDict()
+                    else:
+                        out = model(sample_input_ids, no_error="after_first")
+                    logits = out.logits
 
-                # Calculate token-level accuracy
-                pred_tokens = logits.argmax(dim=-1)
-                base_tokens = base_logits.argmax(dim=-1)
-                accuracy = (pred_tokens == base_tokens).float().mean().item()
-                accuracies.append(accuracy)
+                    # Calculate token-level accuracy
+                    pred_tokens = logits.argmax(dim=-1)
+                    base_tokens = base_logits.argmax(dim=-1)
+                    accuracy = (pred_tokens == base_tokens).float().mean().item()
+                    accuracies.append(accuracy)
 
-                # Calculate KL divergence between predicted and true distributions
-                log_probs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
-                base_log_probs = F.log_softmax(base_logits, dim=-1)  # [batch, seq_len, vocab_size]
+                    # Calculate KL divergence between predicted and true distributions
+                    log_probs = F.log_softmax(logits, dim=-1)  # [batch, seq_len, vocab_size]
+                    base_log_probs = F.log_softmax(base_logits, dim=-1)  # [batch, seq_len, vocab_size]
 
-                # Calculate KL divergence for this batch
-                kl_div = F.kl_div(
-                    log_probs.view(-1, logits.size(-1)),
-                    base_log_probs.view(-1, logits.size(-1)),
-                    reduction='batchmean',
-                    log_target=True
-                ).item()
-                kl_divs.append(kl_div)
+                    # Calculate KL divergence for this sample
+                    kl_div = F.kl_div(
+                        log_probs.view(-1, logits.size(-1)),
+                        base_log_probs.view(-1, logits.size(-1)),
+                        reduction='batchmean',
+                        log_target=True
+                    ).item()
+                    kl_divs.append(kl_div)
 
-                # Calculate attribution scores if requested (only on first batch to avoid excessive computation)
-                if (args.calculate_completeness or args.calculate_replacement) and batch_idx == 0:
-                    print(f"Starting attribution score calculation...")
-                    print(f"calculate_completeness: {args.calculate_completeness}")
-                    print(f"calculate_replacement: {args.calculate_replacement}")
-                    
-                    # Temporarily enable gradients for attribution calculation
-                    with torch.enable_grad():
+                    # Record sample text and output
+                    sample_text = model.tokenizer.decode(sample_input_ids[0])
+                    output_text = model.tokenizer.decode(pred_tokens[0])
+                    samples.append(sample_text)
+                    outputs.append(output_text)
+
+                    # Calculate attribution scores if requested
+                    sample_completeness = None
+                    sample_replacement = None
+                    if args.calculate_completeness or args.calculate_replacement:
                         try:
-                            print(f"Calling calculate_attribution_scores...")
-                            attribution_scores = calculate_attribution_scores(
-                                model, 
-                                input_ids[0:1],  # Use first example only for efficiency
-                                transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
-                                pre_ln_hook=args.pre_ln_hook,
-                                post_ln_hook=args.post_ln_hook,
-                                remove_prefix=args.remove_prefix
-                            )
-                            print(f"Attribution scores calculated: {attribution_scores}")
-                            
-                            if args.calculate_completeness:
-                                completeness_score = attribution_scores['completeness_score']
-                                completeness_scores.append(completeness_score)
-                                print(f"Completeness score: {completeness_score:.4f}")
-                            
-                            if args.calculate_replacement:
-                                replacement_score = attribution_scores['replacement_score']
-                                replacement_scores.append(replacement_score)
-                                print(f"Replacement score: {replacement_score:.4f}")
+                            print(f"Calculating attribution scores for sample {len(samples)}...")
+                            # Temporarily enable gradients for attribution calculation
+                            with torch.enable_grad():
+                                attribution_scores = calculate_attribution_scores(
+                                    model, 
+                                    sample_input_ids,
+                                    transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
+                                    pre_ln_hook=args.pre_ln_hook,
+                                    post_ln_hook=args.post_ln_hook,
+                                    remove_prefix=args.remove_prefix
+                                )
                                 
+                                if args.calculate_completeness:
+                                    sample_completeness = attribution_scores['completeness_score']
+                                    completeness_scores.append(sample_completeness)
+                                
+                                if args.calculate_replacement:
+                                    sample_replacement = attribution_scores['replacement_score']
+                                    replacement_scores.append(sample_replacement)
+                                    
                         except Exception as e:
-                            print(f"Failed to calculate attribution scores: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            # Add fallback values
+                            print(f"Failed to calculate attribution scores for sample {len(samples)}: {e}")
                             if args.calculate_completeness:
                                 completeness_scores.append(0.0)
+                                sample_completeness = 0.0
                             if args.calculate_replacement:
                                 replacement_scores.append(0.0)
+                                sample_replacement = 0.0
+                    else:
+                        # Add None values if not calculating attribution scores
+                        if args.calculate_completeness:
+                            completeness_scores.append(None)
+                        if args.calculate_replacement:
+                            replacement_scores.append(None)
+
+                    # Record detailed metrics for this sample
+                    sample_metric = {
+                        "sample_idx": len(samples) - 1,
+                        "sample_text": sample_text,
+                        "output_text": output_text,
+                        "accuracy": accuracy,
+                        "kl_divergence": kl_div,
+                        "completeness_score": sample_completeness,
+                        "replacement_score": sample_replacement
+                    }
+                    sample_metrics.append(sample_metric)
 
                 # Update progress bar with current and running average metrics
                 postfix = {
                     "Avg Acc": f"{np.mean(accuracies):.4f}",
                     "Avg KL": f"{np.mean(kl_divs):.4f}"
                 }
-                if completeness_scores and len(completeness_scores) > 0:
-                    postfix["Completeness"] = f"{completeness_scores[0]:.4f}"
-                if replacement_scores and len(replacement_scores) > 0:
-                    postfix["Replacement"] = f"{replacement_scores[0]:.4f}"
+                if completeness_scores and any(x is not None for x in completeness_scores):
+                    valid_completeness = [x for x in completeness_scores if x is not None]
+                    if valid_completeness:
+                        postfix["Avg Completeness"] = f"{np.mean(valid_completeness):.4f}"
+                if replacement_scores and any(x is not None for x in replacement_scores):
+                    valid_replacement = [x for x in replacement_scores if x is not None]
+                    if valid_replacement:
+                        postfix["Avg Replacement"] = f"{np.mean(valid_replacement):.4f}"
+                postfix["Samples"] = len(samples)
                 bar.set_postfix(postfix)
     except KeyboardInterrupt:
         pass
@@ -329,16 +360,42 @@ def main():
     mean_kl = np.mean(kl_divs)
     std_kl = np.std(kl_divs)
     
+    # Calculate attribution score averages (only for valid scores)
+    mean_completeness = None
+    std_completeness = None
+    mean_replacement = None
+    std_replacement = None
+    
+    if completeness_scores and any(x is not None for x in completeness_scores):
+        valid_completeness = [x for x in completeness_scores if x is not None]
+        if valid_completeness:
+            mean_completeness = np.mean(valid_completeness)
+            std_completeness = np.std(valid_completeness)
+    
+    if replacement_scores and any(x is not None for x in replacement_scores):
+        valid_replacement = [x for x in replacement_scores if x is not None]
+        if valid_replacement:
+            mean_replacement = np.mean(valid_replacement)
+            std_replacement = np.std(valid_replacement)
+    
     # Add attribution scores to results if calculated
     results_extra = {}
     print(f"Final completeness_scores: {completeness_scores}")
     print(f"Final replacement_scores: {replacement_scores}")
-    if completeness_scores and len(completeness_scores) > 0:
-        results_extra["completeness_score"] = completeness_scores[0]
-        print(f"Adding completeness_score to results: {completeness_scores[0]}")
-    if replacement_scores and len(replacement_scores) > 0:
-        results_extra["replacement_score"] = replacement_scores[0]
-        print(f"Adding replacement_score to results: {replacement_scores[0]}")
+    if mean_completeness is not None:
+        results_extra["completeness_score"] = {
+            "mean": mean_completeness,
+            "std": std_completeness,
+            "num_samples": len([x for x in completeness_scores if x is not None])
+        }
+        print(f"Adding completeness_score to results: {mean_completeness:.4f} ± {std_completeness:.4f}")
+    if mean_replacement is not None:
+        results_extra["replacement_score"] = {
+            "mean": mean_replacement,
+            "std": std_replacement,
+            "num_samples": len([x for x in replacement_scores if x is not None])
+        }
+        print(f"Adding replacement_score to results: {mean_replacement:.4f} ± {std_replacement:.4f}")
     print(f"results_extra: {results_extra}")
 
     # Prepare comprehensive results dictionary
@@ -361,9 +418,11 @@ def main():
         "metadata": {
             "dataset": "NeelNanda/pile-10k",
             "batch_size": args.batch_size,
-            "num_batches": len(accuracies),
-            "total_tokens": len(accuracies) * args.batch_size * (args.max_seq_len - 1),  # -1 for next token prediction
+            "num_batches": len(accuracies) // args.batch_size if args.batch_size > 0 else 0,
+            "total_samples": len(samples),
+            "total_tokens": len(accuracies) * (args.max_seq_len - 1),  # -1 for next token prediction
         },
+        "samples": sample_metrics,  # Detailed metrics for each sample
         **results_extra
     }
     
@@ -390,10 +449,10 @@ def main():
     print("\nEvaluation Results:")
     print(f"Token Accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}")
     print(f"KL Divergence: {mean_kl:.4f} ± {std_kl:.4f}")
-    if completeness_scores and len(completeness_scores) > 0:
-        print(f"Completeness Score: {completeness_scores[0]:.4f}")
-    if replacement_scores and len(replacement_scores) > 0:
-        print(f"Replacement Score: {replacement_scores[0]:.4f}")
+    if mean_completeness is not None:
+        print(f"Completeness Score: {mean_completeness:.4f} ± {std_completeness:.4f}")
+    if mean_replacement is not None:
+        print(f"Replacement Score: {mean_replacement:.4f} ± {std_replacement:.4f}")
     print(f"Results saved to: {output_file}")
 
 if __name__ == "__main__":
