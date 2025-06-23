@@ -91,8 +91,6 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         keep_all_input_nodes=True,
         use_all_targets=False,
         filter_high_freq_early=0.01,
-        secondary_threshold=1e-5,
-        per_layer_position=0,
         use_logit_bias=False,
         use_self_explanation=False
     )
