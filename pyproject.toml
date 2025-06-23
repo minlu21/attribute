@@ -49,7 +49,7 @@ pytorch-triton = [
 
 eai-delphi = { git = "https://github.com/EleutherAI/delphi" }
 # eai-sparsify = { path = "../e2e", editable = true }
-eai-sparsify = { git = "https://github.com/EleutherAI/clt-training", branch="clt" }
+eai-sparsify = { git = "https://github.com/minlu21/eai-sparsify.git", branch="clt-for-attribute" }
 
 
 [tool.ruff]
