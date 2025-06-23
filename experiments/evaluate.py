@@ -97,8 +97,10 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
     
     # Get model outputs with transcoder if available
     if transcoder_path:
+        # Ensure gradients are enabled for the model forward pass
         out = model(input_ids, no_error="after_first")
     else:
+        # For models without transcoder, we need to compute with gradients
         out = model.model(input_ids)
     
     # Create attribution graph
@@ -244,13 +246,15 @@ def main():
                     print(f"calculate_replacement: {args.calculate_replacement}")
                     try:
                         print(f"Calling calculate_attribution_scores...")
-                        attribution_scores = calculate_attribution_scores(
-                            model, 
-                            input_ids[0:1],  # Use first example only for efficiency
-                            transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
-                            pre_ln_hook=args.pre_ln_hook,
-                            post_ln_hook=args.post_ln_hook
-                        )
+                        # Temporarily enable gradients for attribution calculation
+                        with torch.enable_grad():
+                            attribution_scores = calculate_attribution_scores(
+                                model, 
+                                input_ids[0:1],  # Use first example only for efficiency
+                                transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
+                                pre_ln_hook=args.pre_ln_hook,
+                                post_ln_hook=args.post_ln_hook
+                            )
                         print(f"Attribution scores calculated: {attribution_scores}")
                         
                         if args.calculate_completeness:
