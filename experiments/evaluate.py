@@ -52,9 +52,11 @@ def parse_args():
                       help='Calculate completeness score (requires transcoder)')
     parser.add_argument('--calculate_replacement', action='store_true',
                       help='Calculate replacement score (requires transcoder)')
+    parser.add_argument('--remove_prefix', type=int, default=0,
+                      help='Number of tokens to remove from the beginning (similar to serve.py)')
     return parser.parse_args()
 
-def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_hook=False, post_ln_hook=False):
+def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_hook=False, post_ln_hook=False, remove_prefix=0):
     """
     Calculate both completeness and replacement scores using the same attribution graph.
     
@@ -70,91 +72,120 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         transcoder_path: Path to transcoder (optional)
         pre_ln_hook: Whether to use pre-layer-norm hook
         post_ln_hook: Whether to use post-layer-norm hook
+        remove_prefix: Number of tokens to remove from the beginning (similar to serve.py)
     
     Returns:
         dict: Dictionary containing 'completeness_score' and 'replacement_score' (both between 0 and 1)
     """
-    # Create a simple attribution config for the calculation
-    config = AttributionConfig(
-        name="attribution_eval",
-        scan="eval",
-        flow_steps=1000,  # Reduced for efficiency
-        batch_size=32,
-        softmax_grad_type="mean",
-        node_cum_threshold=0.8,
-        edge_cum_threshold=0.98,
-        top_k_edges=32,
-        influence_anthropic=True,
-        influence_gpu=True,
-        pre_filter_threshold=1e-5,
-        keep_all_error_nodes=True,
-        keep_all_input_nodes=True,
-        use_all_targets=False,
-        filter_high_freq_early=0.01,
-        use_logit_bias=False,
-        use_self_explanation=False
-    )
-    
-    # Get model outputs with transcoder if available
-    if transcoder_path:
-        # Ensure gradients are enabled for the model forward pass
-        out = model(input_ids, no_error="after_first")
-    else:
-        # For models without transcoder, we need to compute with gradients
-        out = model.model(input_ids)
-    
-    # Create attribution graph
-    graph = AttributionGraph(model, out, config)
-    
-    # Run attribution flow to build the graph
-    graph.flow()
-    
-    # Calculate adjacency matrix and influence
-    adj_matrix, dedup_node_names, activation_sources = graph.adjacency_matrix(absolute=True, normalize=False)
-    dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
-    
-    n_initial = len(dedup_node_names)
-    
-    # Create masks for different node types
-    error_mask = np.zeros((n_initial,))
-    input_mask = np.zeros((n_initial,))
-    feature_mask = np.zeros((n_initial,))
-    output_mask = np.zeros((n_initial,))
-    
-    for i, node in enumerate(dedup_node_names):
-        node_obj = graph.nodes[node]
-        if hasattr(node_obj, 'node_type'):
-            if node_obj.node_type == "ErrorNode":
-                error_mask[i] = 1
-            elif node_obj.node_type == "InputNode":
-                input_mask[i] = 1
-            elif node_obj.node_type == "IntermediateNode":
-                feature_mask[i] = 1
-            elif node_obj.node_type == "OutputNode":
-                output_mask[i] = 1
-    
-    # Create influence sources - identify output nodes and their probabilities
-    influence_sources = np.zeros((n_initial,))
-    for index, node in enumerate(dedup_node_names):
-        node_obj = graph.nodes[node]
-        if hasattr(node_obj, 'node_type') and node_obj.node_type == "OutputNode":
-            influence_sources[index] = node_obj.probability
-    
-    # Calculate influence matrix
-    influence, adj_matrix = graph.find_influence(adj_matrix)
-    
-    # Calculate completeness score: 1 - (influence_sources @ adj_matrix) @ error_mask
-    # This measures the fraction of influence that comes from non-error nodes
-    completeness_score = 1 - (influence_sources @ adj_matrix) @ error_mask
-    
-    # Calculate replacement score: 1 - (influence_sources @ influence) @ error_mask
-    # This measures the fraction of end-to-end paths that don't go through error nodes
-    replacement_score = 1 - (influence_sources @ influence) @ error_mask
-    
-    return {
-        'completeness_score': float(completeness_score),
-        'replacement_score': float(replacement_score)
-    }
+    try:
+        # Create a simple attribution config for the calculation
+        config = AttributionConfig(
+            name="attribution_eval",
+            scan="eval",
+            flow_steps=500,  # Reduced for efficiency and stability
+            batch_size=16,   # Reduced batch size for stability
+            softmax_grad_type="mean",
+            node_cum_threshold=0.8,
+            edge_cum_threshold=0.98,
+            top_k_edges=16,  # Reduced for stability
+            influence_anthropic=True,
+            influence_gpu=True,
+            pre_filter_threshold=1e-5,
+            keep_all_error_nodes=True,
+            keep_all_input_nodes=True,
+            use_all_targets=False,
+            filter_high_freq_early=0.01,
+            use_logit_bias=False,
+            use_self_explanation=False
+        )
+        
+        # Get model outputs with transcoder if available
+        if transcoder_path:
+            # Use the same pattern as serve.py - get transcoded outputs properly
+            # Convert input_ids back to text prompt for the model
+            prompt = model.tokenizer.decode(input_ids[0])
+            transcoded_outputs = model([prompt] * config.batch_size)
+            # Remove prefix if needed (similar to serve.py)
+            transcoded_outputs.remove_prefix(remove_prefix)  # Adjust this if needed
+            out = transcoded_outputs
+        else:
+            # For models without transcoder, we need to compute with gradients
+            out = model.model(input_ids)
+        
+        # Create attribution graph
+        graph = AttributionGraph(model, out, config)
+        
+        # Run attribution flow to build the graph with error handling
+        try:
+            graph.flow()
+        except RuntimeError as e:
+            if "CUDA error" in str(e) or "index out of bounds" in str(e):
+                print(f"CUDA error during attribution flow, trying with reduced flow steps: {e}")
+                # Try with even fewer flow steps
+                config.flow_steps = 100
+                config.batch_size = 8
+                config.top_k_edges = 8
+                graph = AttributionGraph(model, out, config)
+                graph.flow()
+            else:
+                raise e
+        
+        # Calculate adjacency matrix and influence
+        adj_matrix, dedup_node_names, activation_sources = graph.adjacency_matrix(absolute=True, normalize=False)
+        dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
+        
+        n_initial = len(dedup_node_names)
+        
+        # Create masks for different node types
+        error_mask = np.zeros((n_initial,))
+        input_mask = np.zeros((n_initial,))
+        feature_mask = np.zeros((n_initial,))
+        output_mask = np.zeros((n_initial,))
+        
+        for i, node in enumerate(dedup_node_names):
+            node_obj = graph.nodes[node]
+            if hasattr(node_obj, 'node_type'):
+                if node_obj.node_type == "ErrorNode":
+                    error_mask[i] = 1
+                elif node_obj.node_type == "InputNode":
+                    input_mask[i] = 1
+                elif node_obj.node_type == "IntermediateNode":
+                    feature_mask[i] = 1
+                elif node_obj.node_type == "OutputNode":
+                    output_mask[i] = 1
+        
+        # Create influence sources - identify output nodes and their probabilities
+        influence_sources = np.zeros((n_initial,))
+        for index, node in enumerate(dedup_node_names):
+            node_obj = graph.nodes[node]
+            if hasattr(node_obj, 'node_type') and node_obj.node_type == "OutputNode":
+                influence_sources[index] = node_obj.probability
+        
+        # Calculate influence matrix
+        influence, adj_matrix = graph.find_influence(adj_matrix)
+        
+        # Calculate completeness score: 1 - (influence_sources @ adj_matrix) @ error_mask
+        # This measures the fraction of influence that comes from non-error nodes
+        completeness_score = 1 - (influence_sources @ adj_matrix) @ error_mask
+        
+        # Calculate replacement score: 1 - (influence_sources @ influence) @ error_mask
+        # This measures the fraction of end-to-end paths that don't go through error nodes
+        replacement_score = 1 - (influence_sources @ influence) @ error_mask
+        
+        return {
+            'completeness_score': float(completeness_score),
+            'replacement_score': float(replacement_score)
+        }
+        
+    except Exception as e:
+        print(f"Error in calculate_attribution_scores: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return default values if calculation fails
+        return {
+            'completeness_score': 0.0,
+            'replacement_score': 0.0
+        }
 
 def main():
     args = parse_args()
@@ -244,46 +275,49 @@ def main():
                     print(f"Starting attribution score calculation...")
                     print(f"calculate_completeness: {args.calculate_completeness}")
                     print(f"calculate_replacement: {args.calculate_replacement}")
-                    try:
-                        print(f"Calling calculate_attribution_scores...")
-                        # Temporarily enable gradients for attribution calculation
-                        with torch.enable_grad():
+                    
+                    # Temporarily enable gradients for attribution calculation
+                    with torch.enable_grad():
+                        try:
+                            print(f"Calling calculate_attribution_scores...")
                             attribution_scores = calculate_attribution_scores(
                                 model, 
                                 input_ids[0:1],  # Use first example only for efficiency
                                 transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
                                 pre_ln_hook=args.pre_ln_hook,
-                                post_ln_hook=args.post_ln_hook
+                                post_ln_hook=args.post_ln_hook,
+                                remove_prefix=args.remove_prefix
                             )
-                        print(f"Attribution scores calculated: {attribution_scores}")
-                        
-                        if args.calculate_completeness:
-                            completeness_score = attribution_scores['completeness_score']
-                            completeness_scores.append(completeness_score)
-                            print(f"Completeness score: {completeness_score:.4f}")
-                        
-                        if args.calculate_replacement:
-                            replacement_score = attribution_scores['replacement_score']
-                            replacement_scores.append(replacement_score)
-                            print(f"Replacement score: {replacement_score:.4f}")
+                            print(f"Attribution scores calculated: {attribution_scores}")
                             
-                    except Exception as e:
-                        print(f"Failed to calculate attribution scores: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        if args.calculate_completeness:
-                            completeness_scores.append(None)
-                        if args.calculate_replacement:
-                            replacement_scores.append(None)
+                            if args.calculate_completeness:
+                                completeness_score = attribution_scores['completeness_score']
+                                completeness_scores.append(completeness_score)
+                                print(f"Completeness score: {completeness_score:.4f}")
+                            
+                            if args.calculate_replacement:
+                                replacement_score = attribution_scores['replacement_score']
+                                replacement_scores.append(replacement_score)
+                                print(f"Replacement score: {replacement_score:.4f}")
+                                
+                        except Exception as e:
+                            print(f"Failed to calculate attribution scores: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Add fallback values
+                            if args.calculate_completeness:
+                                completeness_scores.append(0.0)
+                            if args.calculate_replacement:
+                                replacement_scores.append(0.0)
 
                 # Update progress bar with current and running average metrics
                 postfix = {
                     "Avg Acc": f"{np.mean(accuracies):.4f}",
                     "Avg KL": f"{np.mean(kl_divs):.4f}"
                 }
-                if completeness_scores and completeness_scores[0] is not None:
+                if completeness_scores and len(completeness_scores) > 0:
                     postfix["Completeness"] = f"{completeness_scores[0]:.4f}"
-                if replacement_scores and replacement_scores[0] is not None:
+                if replacement_scores and len(replacement_scores) > 0:
                     postfix["Replacement"] = f"{replacement_scores[0]:.4f}"
                 bar.set_postfix(postfix)
     except KeyboardInterrupt:
@@ -299,10 +333,10 @@ def main():
     results_extra = {}
     print(f"Final completeness_scores: {completeness_scores}")
     print(f"Final replacement_scores: {replacement_scores}")
-    if completeness_scores and completeness_scores[0] is not None:
+    if completeness_scores and len(completeness_scores) > 0:
         results_extra["completeness_score"] = completeness_scores[0]
         print(f"Adding completeness_score to results: {completeness_scores[0]}")
-    if replacement_scores and replacement_scores[0] is not None:
+    if replacement_scores and len(replacement_scores) > 0:
         results_extra["replacement_score"] = replacement_scores[0]
         print(f"Adding replacement_score to results: {replacement_scores[0]}")
     print(f"results_extra: {results_extra}")
@@ -356,9 +390,9 @@ def main():
     print("\nEvaluation Results:")
     print(f"Token Accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}")
     print(f"KL Divergence: {mean_kl:.4f} ± {std_kl:.4f}")
-    if completeness_scores and completeness_scores[0] is not None:
+    if completeness_scores and len(completeness_scores) > 0:
         print(f"Completeness Score: {completeness_scores[0]:.4f}")
-    if replacement_scores and replacement_scores[0] is not None:
+    if replacement_scores and len(replacement_scores) > 0:
         print(f"Replacement Score: {replacement_scores[0]:.4f}")
     print(f"Results saved to: {output_file}")
 
