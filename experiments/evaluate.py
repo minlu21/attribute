@@ -174,16 +174,18 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         # This measures the fraction of end-to-end paths that don't go through error nodes
         replacement_score = 1 - (influence_sources @ influence) @ error_mask
         
+        # Store results before cleanup
+        results = {
+            'completeness_score': float(completeness_score),
+            'replacement_score': float(replacement_score)
+        }
+        
         # Clear CUDA cache after attribution calculations
         del graph, out, adj_matrix, influence, influence_sources
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        return {
-            'completeness_score': float(completeness_score),
-            'replacement_score': float(replacement_score)
-        
-        }
+        return results
         
     except Exception as e:
         print(f"Error in calculate_attribution_scores: {e}")
@@ -349,10 +351,8 @@ def main():
                                     post_ln_hook=args.post_ln_hook,
                                     remove_prefix=args.remove_prefix
                                 )
-                                del attribution_scores
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()    
                                 
+                                # Extract scores before cleanup
                                 if args.calculate_completeness:
                                     sample_completeness = attribution_scores['completeness_score']
                                     completeness_scores.append(sample_completeness)
@@ -360,16 +360,11 @@ def main():
                                 if args.calculate_replacement:
                                     sample_replacement = attribution_scores['replacement_score']
                                     replacement_scores.append(sample_replacement)
-                            
-                            # Clear gradients and cache after attribution calculation
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                                # Clear gradients from the model
-                                for param in model.model.parameters():
-                                    if param.grad is not None:
-                                        param.grad.detach_()
-                                        param.grad.zero_()
-                                        
+                                
+                                # Clean up after extracting scores
+                                del attribution_scores
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
                         except Exception as e:
                             print(f"Failed to calculate attribution scores for sample {sample_count + 1}: {e}")
                             if args.calculate_completeness:
