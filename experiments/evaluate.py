@@ -40,6 +40,8 @@ def parse_args():
                       help='Directory to save results')
     parser.add_argument('--batch_size', type=int, default=256,
                       help='Batch size for evaluation')
+    parser.add_argument('--attribution_batch_size', type=int, default=8,
+                      help='Controls how many target nodes are processed simultaneously during the attribution flow for calculating attribution scores.')
     parser.add_argument('--max_seq_len', type=int, default=64,
                       help='Maximum sequence length for evaluation')
     parser.add_argument('--max_steps', type=int, default=128,
@@ -85,7 +87,7 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
             name="attribution_eval",
             scan="eval",
             flow_steps=500,  # Reduced for efficiency and stability
-            batch_size=8,   # Reduced batch size for stability
+            batch_size=args.attribution_batch_size,   # Reduced batch size for stability
             softmax_grad_type="mean",
             node_cum_threshold=0.8,
             edge_cum_threshold=0.98,
