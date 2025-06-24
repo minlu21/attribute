@@ -319,7 +319,7 @@ def main():
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
                                 # Clear gradients from the model
-                                for param in model.parameters():
+                                for param in model.model.parameters():
                                     if param.grad is not None:
                                         param.grad.detach_()
                                         param.grad.zero_()
@@ -359,7 +359,7 @@ def main():
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         # Also clear any gradients that might be lingering
-                        for param in model.parameters():
+                        for param in model.model.parameters():
                             if param.grad is not None:
                                 param.grad.detach_()
                                 param.grad.zero_()
