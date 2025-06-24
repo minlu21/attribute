@@ -175,7 +175,9 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         replacement_score = 1 - (influence_sources @ influence) @ error_mask
         
         # Clear CUDA cache after attribution calculations
+        
         if torch.cuda.is_available():
+            del graph, out, attribution_scores, adj_matrix, influence, influence_sources
             torch.cuda.empty_cache()
         
         return {
@@ -228,9 +230,52 @@ def main():
     kl_divs = []    # KL divergence per sample
     completeness_scores = []  # Completeness scores per sample
     replacement_scores = []   # Replacement scores per sample
-    samples = []     # Sample texts
-    outputs = []     # Model outputs
-    sample_metrics = []  # Detailed metrics per sample
+    sample_count = 0  # Track number of samples processed
+    
+    # Create output file for streaming results
+    output_dir = Path(args.output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    escaped_model_name = args.model.replace("/", "_").replace(":", "_")
+    escaped_transcoder_name = args.transcoder_path.replace("/", "_").replace(":", "_")
+    if args.mlp_trim > 0:
+        escaped_transcoder_name = f"mlp_trim_{args.mlp_trim}"
+    escaped_model_transcoder_name = f"{escaped_model_name}-{escaped_transcoder_name}"
+    output_file = output_dir / f"eval_results_{escaped_model_transcoder_name}.json"
+    
+    # Initialize the JSON file with metadata
+    initial_results = {
+        "model": args.model,
+        **(
+            {"transcoder_path": args.transcoder_path}
+            if args.mlp_trim == 0
+            else {"mlp_trim": args.mlp_trim}
+        ),
+        "timestamp": datetime.now().isoformat(),
+        "metadata": {
+            "dataset": "NeelNanda/pile-10k",
+            "batch_size": args.batch_size,
+            "max_seq_len": args.max_seq_len,
+            "max_steps": args.max_steps,
+        },
+        "samples": []
+    }
+    
+    # Write initial structure to file
+    with open(output_file, 'w') as f:
+        json.dump(initial_results, f, indent=2)
+    
+    def append_sample_to_json(sample_data):
+        """Append a sample to the JSON file"""
+        # Read the current file
+        with open(output_file, 'r') as f:
+            data = json.load(f)
+        
+        # Append the new sample
+        data["samples"].append(sample_data)
+        
+        # Write back to file
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=2)
 
     def mlp_trimmer(module, input, output):
         values, indices = torch.topk(output, args.mlp_trim, dim=-1)
@@ -287,15 +332,13 @@ def main():
                     # Record sample text and output
                     sample_text = model.tokenizer.decode(sample_input_ids[0])
                     output_text = model.tokenizer.decode(pred_tokens[0])
-                    samples.append(sample_text)
-                    outputs.append(output_text)
 
                     # Calculate attribution scores if requested
                     sample_completeness = None
                     sample_replacement = None
                     if args.calculate_completeness or args.calculate_replacement:
                         try:
-                            print(f"Calculating attribution scores for sample {len(samples)}...")
+                            print(f"Calculating attribution scores for sample {sample_count + 1}...")
                             # Temporarily enable gradients for attribution calculation
                             with torch.enable_grad():
                                 attribution_scores = calculate_attribution_scores(
@@ -325,7 +368,7 @@ def main():
                                         param.grad.zero_()
                                         
                         except Exception as e:
-                            print(f"Failed to calculate attribution scores for sample {len(samples)}: {e}")
+                            print(f"Failed to calculate attribution scores for sample {sample_count + 1}: {e}")
                             if args.calculate_completeness:
                                 completeness_scores.append(0.0)
                                 sample_completeness = 0.0
@@ -345,7 +388,7 @@ def main():
 
                     # Record detailed metrics for this sample
                     sample_metric = {
-                        "sample_idx": len(samples) - 1,
+                        "sample_idx": sample_count,
                         "sample_text": sample_text,
                         "output_text": output_text,
                         "accuracy": accuracy,
@@ -353,7 +396,7 @@ def main():
                         "completeness_score": sample_completeness,
                         "replacement_score": sample_replacement
                     }
-                    sample_metrics.append(sample_metric)
+                    append_sample_to_json(sample_metric)
 
                     # Clear CUDA cache after each sample to prevent memory accumulation
                     if torch.cuda.is_available():
@@ -368,7 +411,7 @@ def main():
                         if args.monitor_memory:
                             allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                             reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-                            print(f"Sample {len(samples)} - CUDA Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                            print(f"Sample {sample_count + 1} - CUDA Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
                 # Update progress bar with current and running average metrics
                 postfix = {
@@ -383,8 +426,9 @@ def main():
                     valid_replacement = [x for x in replacement_scores if x is not None]
                     if valid_replacement:
                         postfix["Avg Replacement"] = f"{np.mean(valid_replacement):.4f}"
-                postfix["Samples"] = len(samples)
+                postfix["Samples"] = sample_count + 1
                 bar.set_postfix(postfix)
+                sample_count += 1
     except KeyboardInterrupt:
         pass
 
@@ -453,10 +497,10 @@ def main():
             "dataset": "NeelNanda/pile-10k",
             "batch_size": args.batch_size,
             "num_batches": len(accuracies) // args.batch_size if args.batch_size > 0 else 0,
-            "total_samples": len(samples),
+            "total_samples": len(accuracies),
             "total_tokens": len(accuracies) * (args.max_seq_len - 1),  # -1 for next token prediction
         },
-        "samples": sample_metrics,  # Detailed metrics for each sample
+        "samples": sample_count,  # Total number of samples processed
         **results_extra
     }
     
@@ -466,18 +510,16 @@ def main():
     if "replacement_score" in results:
         print(f"replacement_score in results: {results['replacement_score']}")
 
-    # Save results with timestamp for tracking experiments
-    output_dir = Path(args.output_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    escaped_model_name = args.model.replace("/", "_").replace(":", "_")
-    escaped_transcoder_name = args.transcoder_path.replace("/", "_").replace(":", "_")
-    if args.mlp_trim > 0:
-        escaped_transcoder_name = f"mlp_trim_{args.mlp_trim}"
-    escaped_model_transcoder_name = f"{escaped_model_name}-{escaped_transcoder_name}"
-    output_file = output_dir / f"eval_results_{escaped_model_transcoder_name}.json"
-
+    # Update the JSON file with final results
+    with open(output_file, 'r') as f:
+        data = json.load(f)
+    
+    # Update with final statistics
+    data.update(results)
+    
+    # Write final results back to file
     with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(data, f, indent=2)
 
     # Print summary statistics
     print("\nEvaluation Results:")
