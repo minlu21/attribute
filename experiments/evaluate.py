@@ -175,14 +175,13 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         replacement_score = 1 - (influence_sources @ influence) @ error_mask
         
         # Clear CUDA cache after attribution calculations
-        
+        del graph, out, adj_matrix, influence, influence_sources
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
         return {
             'completeness_score': float(completeness_score),
             'replacement_score': float(replacement_score)
-            del graph, out, attribution_scores, adj_matrix, influence, influence_sources
             torch.cuda.empty_cache()
         
         }
@@ -351,6 +350,9 @@ def main():
                                     post_ln_hook=args.post_ln_hook,
                                     remove_prefix=args.remove_prefix
                                 )
+                                del attribution_scores
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()    
                                 
                                 if args.calculate_completeness:
                                     sample_completeness = attribution_scores['completeness_score']
