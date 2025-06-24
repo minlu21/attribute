@@ -177,12 +177,14 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         # Clear CUDA cache after attribution calculations
         
         if torch.cuda.is_available():
-            del graph, out, attribution_scores, adj_matrix, influence, influence_sources
             torch.cuda.empty_cache()
         
         return {
             'completeness_score': float(completeness_score),
             'replacement_score': float(replacement_score)
+            del graph, out, attribution_scores, adj_matrix, influence, influence_sources
+            torch.cuda.empty_cache()
+        
         }
         
     except Exception as e:
