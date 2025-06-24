@@ -182,7 +182,6 @@ def calculate_attribution_scores(model, input_ids, transcoder_path=None, pre_ln_
         return {
             'completeness_score': float(completeness_score),
             'replacement_score': float(replacement_score)
-            torch.cuda.empty_cache()
         
         }
         
