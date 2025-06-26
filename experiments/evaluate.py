@@ -44,6 +44,8 @@ def parse_args():
                       help='Use pre-layer-norm hook')
     parser.add_argument('--post_ln_hook', action='store_true',
                       help='Use post-layer-norm hook')
+    parser.add_argument('--offload', action='store_true',
+                      help='Offload transcoder to disk.')
     return parser.parse_args()
 
 def main():
@@ -55,6 +57,7 @@ def main():
         transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
         pre_ln_hook=args.pre_ln_hook,
         post_ln_hook=args.post_ln_hook,
+        offload=args.offload,
     )
 
     # Load and preprocess dataset into fixed-length chunks for efficient batching

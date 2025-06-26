@@ -679,13 +679,20 @@ class TranscodedModel(object):
 
     def freeze_attention_pattern(self, hookpoint: str):
         index = self.name_to_index[hookpoint]
+        outputs_saved = {}
         def freeze_slice(module, input, output, start, end):
+            module_name = self.name_to_module[hookpoint]
+            if module_name in outputs_saved:
+                output = outputs_saved[module_name]
             if start == 0 and end == output.shape[-1]:
-                return output.detach()
-            indices = torch.arange(output.shape[-1], device=output.device)
-            mask = (indices >= start) & (indices < end)
-            output = torch.where(mask, output.detach(), output)
-            return output.detach()
+                result = output.detach()
+            else:
+                indices = torch.arange(output.shape[-1], device=output.device)
+                mask = (indices >= start) & (indices < end)
+                output = torch.where(mask, output.detach(), output)
+                result = output.detach()
+            outputs_saved[module_name] = result
+            return result
         for module, start, end in (self.attn_q_slice(index), self.attn_k_slice(index)):
             module.register_forward_hook(partial(freeze_slice,
                                                  start=torch.tensor(start, device=self.device),
