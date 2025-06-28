@@ -160,7 +160,7 @@ class TranscodedModel(object):
             for arr in [self.hookpoints_layer, self.hookpoints_mlp, self.hookpoints_ln, self.hookpoints_mlp_post]
             for i, k in enumerate(arr)
         }
-        self.module_to_name = {v: k for k, v in self.name_to_module.items()}
+        self.module_to_name = {v: k for k, v in self.model.named_modules()}
         self.pre_ln_hook = pre_ln_hook
         self.post_ln_hook = post_ln_hook
 
@@ -681,7 +681,7 @@ class TranscodedModel(object):
         index = self.name_to_index[hookpoint]
         outputs_saved = {}
         def freeze_slice(module, input, output, start, end):
-            module_name = self.name_to_module[hookpoint]
+            module_name = self.module_to_name[module]
             if module_name in outputs_saved:
                 output = outputs_saved[module_name]
             if start == 0 and end == output.shape[-1]:

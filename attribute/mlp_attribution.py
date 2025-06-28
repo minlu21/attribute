@@ -200,11 +200,14 @@ class AttributionGraph:
         dedup_node_indices = {name: i for i, name in enumerate(dedup_node_names)}
 
         n_initial = len(dedup_node_names)
-        error_mask = np.zeros((n_initial,))
+        emb_mask = np.zeros((n_initial,), dtype=np.bool_)
+        error_mask = np.zeros((n_initial,), dtype=np.bool_)
         for i, node in enumerate(dedup_node_names):
             node = self.nodes[node]
             if isinstance(node, ErrorNode):
                 error_mask[i] = 1
+            if isinstance(node, InputNode):
+                emb_mask[i] = 1
 
         logger.info("Finding influence sources")
         influence_sources = np.zeros((n_initial,))
@@ -218,14 +221,17 @@ class AttributionGraph:
 
         influence, adj_matrix = self.find_influence(adj_matrix)
 
-        completeness_score_unpruned = 1 - (influence_sources @ adj_matrix) @ error_mask
-        logger.info(f"Completeness score (unpruned): {completeness_score_unpruned:.3f}")
-
-        replacement_score_unpruned = 1 - (influence_sources @ influence) @ error_mask
-        logger.info(f"Replacement score (unpruned): {replacement_score_unpruned:.3f}")
-
         usage = influence_sources @ influence
         logger.info(f"Top influences: {usage[np.argsort(usage)[-10:][::-1]].tolist()}")
+
+        usage_and_sources = usage
+        completeness_score_unpruned = (usage_and_sources * (1 - adj_matrix[:, error_mask].sum(axis=1))).sum() / usage_and_sources.sum()
+        logger.info(f"Completeness score (unpruned): {completeness_score_unpruned:.3f}")
+
+        influence_emb = usage[emb_mask].sum()
+        influence_err = usage[error_mask].sum()
+        replacement_score_unpruned = influence_emb / (influence_emb + influence_err)
+        logger.info(f"Replacement score (unpruned): {replacement_score_unpruned:.3f}")
 
         logger.info("Selecting nodes and edges")
         selected_nodes = [node for i, node in enumerate(dedup_node_names)
@@ -277,9 +283,11 @@ class AttributionGraph:
         filtered_node_influence = influence_sources[filtered_mask] @ filtered_influence
         filtered_influence = filtered_adj_matrix * (filtered_node_influence + influence_sources[filtered_mask])[None, :]
 
-        completeness_score = float(1 - (influence_sources[filtered_mask] @ filtered_adj_matrix) @ error_mask[filtered_mask])
+        completeness_score = (usage_and_sources[filtered_mask] * (1 - filtered_adj_matrix[:, error_mask[filtered_mask]].sum(axis=1))).sum() / usage_and_sources[filtered_mask].sum()
         logger.info(f"Completeness score: {completeness_score:.3f}")
-        replacement_score = float(1 - filtered_node_influence @ error_mask[filtered_mask])
+        influence_emb = filtered_node_influence[emb_mask[filtered_mask]].sum()
+        influence_err = filtered_node_influence[error_mask[filtered_mask]].sum()
+        replacement_score = float(influence_emb / (influence_emb + influence_err))
         logger.info(f"Replacement score: {replacement_score:.3f}")
 
         selected_edge_matrix = np.sort(filtered_influence.flatten())[::-1]
