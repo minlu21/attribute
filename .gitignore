@@ -7,7 +7,11 @@ attribution_graph.json
 uv.lock
 delphi.log
 /.gradio
+<<<<<<< HEAD
 .hf_auth
 .python-version
 .venv
 *.egg-info
+=======
+*.egg-info/
+>>>>>>> ccdbe4fdc62f49c7f12e9d166e1ef63ce343e70f

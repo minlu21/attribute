@@ -22,7 +22,8 @@ dependencies = [
     "transformers>=4.51.3",
     "gradio>=5.30.0",
     "neuronpedia>=1.0.20",
-    "huggingface_hub"
+    "huggingface_hub",
+    "datasets>=2.14.6",
 ]
 
 [tool.setuptools]

@@ -40,6 +40,12 @@ def parse_args():
                       help='Maximum sequence length for evaluation')
     parser.add_argument('--max_steps', type=int, default=128,
                       help='Maximum number of steps for evaluation')
+    parser.add_argument('--pre_ln_hook', action='store_true',
+                      help='Use pre-layer-norm hook')
+    parser.add_argument('--post_ln_hook', action='store_true',
+                      help='Use post-layer-norm hook')
+    parser.add_argument('--offload', action='store_true',
+                      help='Offload transcoder to disk.')
     return parser.parse_args()
 
 def main():
@@ -49,6 +55,9 @@ def main():
     model = TranscodedModel(
         args.model,
         transcoder_path=args.transcoder_path if args.mlp_trim == 0 else None,
+        pre_ln_hook=args.pre_ln_hook,
+        post_ln_hook=args.post_ln_hook,
+        offload=args.offload,
     )
 
     # Load and preprocess dataset into fixed-length chunks for efficient batching
@@ -99,7 +108,7 @@ def main():
                     for m in model.model.modules():
                         m._forward_hooks = OrderedDict()
                 else:
-                    out = model(input_ids, no_error=True)
+                    out = model(input_ids, no_error="after_first")
                 logits = out.logits
 
                 # Calculate token-level accuracy

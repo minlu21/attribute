@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import torch
 from jaxtyping import Array, Float, Int
@@ -159,7 +160,7 @@ class TranscodedModel(object):
             for arr in [self.hookpoints_layer, self.hookpoints_mlp, self.hookpoints_ln, self.hookpoints_mlp_post]
             for i, k in enumerate(arr)
         }
-        self.module_to_name = {v: k for k, v in self.name_to_module.items()}
+        self.module_to_name = {v: k for k, v in self.model.named_modules()}
         self.pre_ln_hook = pre_ln_hook
         self.post_ln_hook = post_ln_hook
 
@@ -182,7 +183,8 @@ class TranscodedModel(object):
                  steer_features: dict[int, list[(int, int, float)]] = {},
                  errors_from: TranscodedOutputs | None = None,
                  latents_from_errors: bool = False,
-                 no_error: bool = False) -> TranscodedOutputs:
+                 no_error: Literal[False, "none", "all", "after_first"] = "none"
+                ) -> TranscodedOutputs:
         if isinstance(prompt, str):
             tokenized_prompt = self.tokenizer(prompt, return_tensors="pt").to(self.device)
             logger.info(f"Tokenized prompt: {[self.decode_token(i) for i in tokenized_prompt.input_ids[0]]}")
@@ -196,7 +198,6 @@ class TranscodedModel(object):
         self.clear_hooks()
 
         def ln_record_hook(module, input, output):
-            return output
             if "rmsnorm" in type(module).__name__.lower():
                 mean = 0
             else:
@@ -359,8 +360,12 @@ class TranscodedModel(object):
             transcoder_out = sae_out.view(output.shape)
             diff = output - transcoder_out
 
-            if no_error:
-                error = torch.zeros_like(output)
+            if no_error not in (False, "none"):
+                if no_error == "after_first":
+                    error = diff.clone()
+                    error[:, 1:] = 0
+                else:
+                    error = torch.zeros_like(output)
             elif errors_from is None:
                 error = diff
             else:
@@ -674,13 +679,20 @@ class TranscodedModel(object):
 
     def freeze_attention_pattern(self, hookpoint: str):
         index = self.name_to_index[hookpoint]
+        outputs_saved = {}
         def freeze_slice(module, input, output, start, end):
+            module_name = self.module_to_name[module]
+            if module_name in outputs_saved:
+                output = outputs_saved[module_name]
             if start == 0 and end == output.shape[-1]:
-                return output.detach()
-            indices = torch.arange(output.shape[-1], device=output.device)
-            mask = (indices >= start) & (indices < end)
-            output = torch.where(mask, output.detach(), output)
-            return output.detach()
+                result = output.detach()
+            else:
+                indices = torch.arange(output.shape[-1], device=output.device)
+                mask = (indices >= start) & (indices < end)
+                output = torch.where(mask, output.detach(), output)
+                result = output.detach()
+            outputs_saved[module_name] = result
+            return result
         for module, start, end in (self.attn_q_slice(index), self.attn_k_slice(index)):
             module.register_forward_hook(partial(freeze_slice,
                                                  start=torch.tensor(start, device=self.device),
